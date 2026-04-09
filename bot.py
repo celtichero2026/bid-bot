@@ -4,7 +4,7 @@ import os
 from typing import Literal
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-LEADER_ROLE_ID = 123456789012345678  # replace with your leader role ID
+LEADER_ROLE_ID = 1491911887493923029  # replace with your leader role ID
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
