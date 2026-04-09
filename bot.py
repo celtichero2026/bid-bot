@@ -24,18 +24,18 @@ async def bid(
 ):
     parts = [toon, str(amount)]
 
-    if priority:
-        parts.append(priority)
+if priority:
+    parts.append(priority)
 
-    msg = " ".join(parts)
+if everyone:
+    parts.append("@everyone")
 
-    if everyone:
-        msg = f"@everyone {msg}"
+msg = " ".join(parts)
 
-    await interaction.response.send_message(
-        msg,
-        allowed_mentions=discord.AllowedMentions(everyone=True)
-    )
+await interaction.response.send_message(
+    msg,
+    allowed_mentions=discord.AllowedMentions(everyone=True)
+)
 
 @bot.tree.command(name="review", description="Tag leaders for bid review")
 async def review(interaction: discord.Interaction, reason: str):
