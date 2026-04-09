@@ -9,18 +9,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
     print(f"Logged in as {bot.user}")
 
-# Example command
 @bot.command()
 async def ping(ctx):
     await ctx.send("Pong!")
 
-# Example bid command (simple)
-@bot.command()
-async def bid(ctx, amount: int):
-    await ctx.send(f"{ctx.author.name} bid {amount}")
+@bot.tree.command(name="bid", description="Place a bid")
+async def bid(interaction: discord.Interaction, amount: int):
+    await interaction.response.send_message(f"{interaction.user.name} bid {amount}")
 
-# Run bot using environment variable (SAFE)
 TOKEN = os.getenv("DISCORD_TOKEN")
 bot.run(TOKEN)
