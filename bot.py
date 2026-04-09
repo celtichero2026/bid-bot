@@ -1,4 +1,17 @@
+import discord
+from discord.ext import commands
+import os
 from typing import Literal
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="bid", description="Post a bid")
 async def bid(
@@ -17,7 +30,7 @@ async def bid(
     m9: discord.Member = None,
     m10: discord.Member = None
 ):
-    mentions = [m.mention for m in [m1,m2,m3,m4,m5,m6,m7,m8,m9,m10] if m]
+    mentions = [m.mention for m in [m1, m2, m3, m4, m5, m6, m7, m8, m9, m10] if m]
 
     parts = [toon, str(amount)]
 
@@ -30,3 +43,5 @@ async def bid(
     msg = " ".join(parts)
 
     await interaction.response.send_message(msg)
+
+bot.run(TOKEN)
