@@ -15,7 +15,17 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="bid", description="Post a bid", guild=discord.Object(id=GUILD_ID))
-async def bid(interaction: discord.Interaction, toon: str, amount: int, user: discord.Member):
-    await interaction.response.send_message(f"{toon} {amount} {user.mention}")
+async def bid(
+    interaction: discord.Interaction,
+    toon: str,
+    amount: int,
+    user: discord.Member = None
+):
+    if user:
+        msg = f"{toon} {amount} {user.mention}"
+    else:
+        msg = f"{toon} {amount}"
+
+    await interaction.response.send_message(msg)
 
 bot.run(TOKEN)
