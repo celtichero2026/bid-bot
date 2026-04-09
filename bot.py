@@ -4,14 +4,12 @@ import os
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    guild = discord.Object(id=GUILD_ID)
-  await bot.tree.sync()
+    await bot.tree.sync()
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="bid", description="Post a bid")
