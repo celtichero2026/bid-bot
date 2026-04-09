@@ -4,7 +4,7 @@ import os
 from typing import Literal
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-LEADER_ROLE_ID = 1491911887493923029  # your leader role ID
+LEADER_ROLE_ID = 1491911887493923029
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -19,23 +19,23 @@ async def bid(
     interaction: discord.Interaction,
     toon: str,
     amount: int,
-    priority: Literal["Main", "Alt"] = None,
+    priority: Literal["Main", "Alt"] | None = None,
     everyone: bool = False
 ):
     parts = [toon, str(amount)]
 
-if priority:
-    parts.append(priority)
+    if priority:
+        parts.append(priority)
 
-if everyone:
-    parts.append("@everyone")
+    if everyone:
+        parts.append("@everyone")
 
-msg = " ".join(parts)
+    msg = " ".join(parts)
 
-await interaction.response.send_message(
-    msg,
-    allowed_mentions=discord.AllowedMentions(everyone=True)
-)
+    await interaction.response.send_message(
+        msg,
+        allowed_mentions=discord.AllowedMentions(everyone=True)
+    )
 
 @bot.tree.command(name="review", description="Tag leaders for bid review")
 async def review(interaction: discord.Interaction, reason: str):
