@@ -14,17 +14,9 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="bid", description="Post a bid")
-async def bid(
-    interaction: discord.Interaction,
-    toon: str,
-    amount: int,
-    user: discord.Member
-):
-    await interaction.response.defer()
-
-    channel = interaction.channel
-    new_line = f"{toon} {amount} {user.mention}"
-
+async def bid(interaction: discord.Interaction, toon: str, amount: int, user: discord.Member):
+    await interaction.response.send_message(f"{toon} {amount} {user.mention}")
+    
     # create or update message
     if channel.id not in bid_messages:
         msg = await channel.send(new_line)
