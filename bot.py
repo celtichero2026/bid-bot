@@ -4,7 +4,7 @@ import os
 from typing import Literal
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-LEADER_ROLE_ID = 1491911887493923029  # replace with your leader role ID
+LEADER_ROLE_ID = 1491911887493923029  # your leader role ID
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -46,12 +46,13 @@ async def bid(
     await interaction.response.send_message(msg)
 
 @bot.tree.command(name="review", description="Tag leaders for bid review")
-async def review(
-    interaction: discord.Interaction,
-    reason: str
-):
-    leader_mention = f"<@&{LEADER_ROLE_ID}>"
-    msg = f"{leader_mention} Review needed: {reason}"
-    await interaction.response.send_message(msg)
+async def review(interaction: discord.Interaction, reason: str):
+    role = interaction.guild.get_role(LEADER_ROLE_ID)
+
+    if role is None:
+        await interaction.response.send_message("Role not found in this server")
+        return
+
+    await interaction.response.send_message(f"{role.mention} Review needed: {reason}")
 
 bot.run(TOKEN)
