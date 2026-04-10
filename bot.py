@@ -18,6 +18,15 @@ ALLOWED_CHANNEL_IDS = [
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+def is_allowed_channel(channel: discord.abc.GuildChannel | discord.Thread) -> bool:
+    if channel.id in ALLOWED_CHANNEL_IDS:
+        return True
+
+    if isinstance(channel, discord.Thread) and channel.parent_id in ALLOWED_CHANNEL_IDS:
+        return True
+
+    return False
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
@@ -31,7 +40,7 @@ async def bid(
     priority: Literal["Main", "Alt"] = None,
     everyone: bool = False
 ):
-    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+    if not is_allowed_channel(interaction.channel):
         await interaction.response.send_message(
             "Use this in the bid channels only.",
             ephemeral=True
@@ -55,7 +64,7 @@ async def bid(
 
 @bot.tree.command(name="review", description="Tag leaders for bid review")
 async def review(interaction: discord.Interaction, reason: str):
-    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+    if not is_allowed_channel(interaction.channel):
         await interaction.response.send_message(
             "Use this in the bid channels only.",
             ephemeral=True
