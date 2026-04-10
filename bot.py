@@ -74,4 +74,30 @@ async def review(interaction: discord.Interaction, reason: str):
         allowed_mentions=discord.AllowedMentions(roles=True)
     )
 
+@bot.tree.command(name="pay", description="Generate %pay from last bid")
+async def pay(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in the bid channels only.",
+            ephemeral=True
+        )
+        return
+
+    # get last 10 messages just to be safe
+    messages = [m async for m in interaction.channel.history(limit=10)]
+
+    # find last bot bid message
+    for msg in messages:
+        if msg.author == bot.user:
+            content = msg.content.strip().split()
+
+            if len(content) >= 2:
+                toon = content[0]
+                amount = content[1]
+
+                await interaction.response.send_message(f"%pay {toon} {amount}")
+                return
+
+    await interaction.response.send_message("No valid bid found.")
+
 bot.run(TOKEN)
