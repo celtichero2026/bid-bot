@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
 import os
-from typing import Literal
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 LEADER_ROLE_ID = 1415053351116079219
@@ -36,9 +35,7 @@ async def on_ready():
 async def bid(
     interaction: discord.Interaction,
     toon: str,
-    amount: int,
-    priority: Literal["Main", "Alt"] = None,
-    everyone: bool = False
+    amount: int
 ):
     if not is_allowed_channel(interaction.channel):
         await interaction.response.send_message(
@@ -47,15 +44,7 @@ async def bid(
         )
         return
 
-    parts = [toon, str(amount)]
-
-    if priority:
-        parts.append(priority)
-
-    if everyone:
-        parts.append("@everyone")
-
-    msg = " ".join(parts)
+    msg = f"{toon} {amount} @everyone"
 
     await interaction.response.send_message(
         msg,
