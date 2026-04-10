@@ -74,9 +74,15 @@ async def review(interaction: discord.Interaction, reason: str):
     role = interaction.guild.get_role(LEADER_ROLE_ID)
 
     if role is None:
-        await interaction.response.send_message("Leader role not found in this server")
+        await interaction.response.send_message(
+            "Leader role not found in this server",
+            ephemeral=True
+        )
         return
 
-    await interaction.response.send_message(f"{role.mention} Review needed: {reason}")
+    await interaction.response.send_message(
+        f"{role.mention} Review needed: {reason}",
+        allowed_mentions=discord.AllowedMentions(roles=True)
+    )
 
 bot.run(TOKEN)
