@@ -4,7 +4,16 @@ import os
 from typing import Literal
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-LEADER_ROLE_ID = 1491911887493923029
+LEADER_ROLE_ID = 1415053351116079219
+
+ALLOWED_CHANNEL_IDS = [
+    1447764043090755646,
+    1447764333894434837,
+    1447764834132295782,
+    1447765010800578782,
+    1447765179172524184,
+    1447765439366168687,
+]
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -19,9 +28,16 @@ async def bid(
     interaction: discord.Interaction,
     toon: str,
     amount: int,
-    priority: Literal["Main", "Alt"] | None = None,
+    priority: Literal["Main", "Alt"] = None,
     everyone: bool = False
 ):
+    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message(
+            "Use this in the bid channels only.",
+            ephemeral=True
+        )
+        return
+
     parts = [toon, str(amount)]
 
     if priority:
@@ -39,10 +55,17 @@ async def bid(
 
 @bot.tree.command(name="review", description="Tag leaders for bid review")
 async def review(interaction: discord.Interaction, reason: str):
+    if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+        await interaction.response.send_message(
+            "Use this in the bid channels only.",
+            ephemeral=True
+        )
+        return
+
     role = interaction.guild.get_role(LEADER_ROLE_ID)
 
     if role is None:
-        await interaction.response.send_message("Role not found in this server")
+        await interaction.response.send_message("Leader role not found in this server")
         return
 
     await interaction.response.send_message(f"{role.mention} Review needed: {reason}")
