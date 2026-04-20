@@ -12,6 +12,31 @@ LEADER_ROLE_IDS = [
     1495844307666731069,   # test server role
 ]
 
+def is_leader(member: discord.Member | discord.User | None, guild: discord.Guild | None) -> bool:
+    if member is None or guild is None:
+        return False
+
+    if not isinstance(member, discord.Member):
+        return False
+
+    return any(role.id in LEADER_ROLE_IDS for role in member.roles)
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"App command error: {repr(error)}")
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            f"Error: {type(error).__name__}: {error}",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Error: {type(error).__name__}: {error}",
+            ephemeral=True
+        )
+
+
 
 ALLOWED_CHANNEL_IDS = [
     1447764043090755646,  # Druid
