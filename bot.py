@@ -512,6 +512,23 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
         )
         return
 
+    # 🔒 BLOCK CLOSED BIDS
+    if state["phase"] == 3 or state["closed"]:
+        await interaction.response.send_message(
+            "🔒 Bidding is closed for this item.",
+            ephemeral=True
+        )
+        return
+
+    # ⏰ PHASE 2 RESTRICTION
+    phase1_bidders = state.get("phase1_bidders", set())
+    if state["phase"] == 2 and phase1_bidders and interaction.user.id not in phase1_bidders:
+        await interaction.response.send_message(
+            "⏰ Bidding is in Phase 2 and restricted to users who placed a valid bid in the first 24 hours.",
+            ephemeral=True,
+        )
+        return        
+
     # ✅ LIMIT: max 7 bids per user
     user_bid_count = count_user_bids(state, interaction.user.id)
 
@@ -551,11 +568,22 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
             )
             return
 
-        # ✅ VALID BID → update state
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    # ✅ VALID BID → update state
     state["current_bid"] = amount
     state["current_toon"] = toon
     state["current_bidder_id"] = interaction.user.id
-    state["last_bid_time"] = datetime.now(timezone.utc).isoformat()
+    state["last_bid_time"] = now_str
+    state["phase1_bidders"].add(interaction.user.id)
+
+    state["last_valid_bid"] = {
+        "toon": toon,
+        "amount": amount,
+        "bidder_id": interaction.user.id,
+        "message_id": None,
+        "timestamp": now_str,
+    }
 
     # log bid
     state.setdefault("bid_log", []).append({
@@ -563,10 +591,12 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
         "amount": amount,
         "bidder_id": interaction.user.id,
         "message_id": None,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_str,
         "valid": True,
         "reason": None,
     })
+
+    save_state()
 
     remaining = 7 - (user_bid_count + 1)
 
