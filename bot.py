@@ -260,25 +260,38 @@ async def on_message(message: discord.Message):
         return
 
     channel = message.channel
+
+    # Only moderate thread chatter in allowed threads
     if isinstance(channel, discord.Thread) and is_allowed_channel(channel):
-        content = (message.content or "").strip()
+        # Do nothing unless this thread already has an active/opened auction
+        state = get_state(channel.id)
+        if state is None:
+            await bot.process_commands(message)
+            return
 
-        # Ignore obvious bot command prefixes just in case
-        if not content.startswith("/"):
-            try:
-                await message.add_reaction("❌")
-            except discord.Forbidden:
-                pass
+        # Allow the thread starter message to exist without warning
+        if message.id == channel.id:
+            await bot.process_commands(message)
+            return
 
-            try:
-                await channel.send(
-                    f"{message.author.mention} Please keep this thread clean. "
-                    "Use `/bid` to bid or `/review` if something needs leader attention.",
-                    delete_after=12,
-                    allowed_mentions=discord.AllowedMentions(users=True),
-                )
-            except discord.Forbidden:
-                pass
+        try:
+            await message.add_reaction("❌")
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+        try:
+            await channel.send(
+                f"{message.author.mention} Please keep this thread clean. "
+                "Use `/bid` to bid or `/review` if something needs leader attention.",
+                delete_after=12,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
 
     await bot.process_commands(message)
 
