@@ -7,8 +7,11 @@ from discord.ext import commands, tasks
 from discord import app_commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-LEADER_ROLE_ID = 1415053351116079219
-LEADER_ROLE_ID = 1495844307666731069
+LEADER_ROLE_IDS = [
+    1415053351116079219,  # main server
+    1495844307666731069,   # test server role
+]
+
 
 ALLOWED_CHANNEL_IDS = [
     1447764043090755646,  # Druid
