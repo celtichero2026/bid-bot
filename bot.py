@@ -604,7 +604,7 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
         f"💰 **New Bid!**\n"
         f"{toon} → {amount:,}\n"
         f"Next min: {amount + min_outbid:,}\n"
-        f"Bids remaining: {remaining}/7",
+        f"Bids remaining: {remaining}",
         allowed_mentions=discord.AllowedMentions.none()
     )
 
