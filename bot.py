@@ -401,6 +401,10 @@ async def before_phase_checker():
 # Commands
 # ──────────────────────────────────────────────────────────────────────────────
 
+@bot.tree.command(name="ping")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong")
+
 @bot.tree.command(name="open", description="Open a new bid thread")
 @app_commands.describe(
     toon="The toon name for the opening bid",
