@@ -435,10 +435,11 @@ async def open_bid(interaction: discord.Interaction, toon: str, amount: int, min
 
     outbid_inc = min_outbid_from_min_bid(min_bid)
 
-    await interaction.response.send_message(
-        f"{toon} {amount:,} | Min bid: {min_bid:,} | Min outbid: {outbid_inc:,}",
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+   await interaction.response.send_message(
+    f"✅ Bid opened\n"
+    f"{toon} {amount:,} | Min bid: {min_bid:,} | Min outbid: {outbid_inc:,}",
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
     sent = await interaction.original_response()
 
