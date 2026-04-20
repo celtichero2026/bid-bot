@@ -263,8 +263,14 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # ✅ Allow normal comments from leaders
+    if is_leader(message.author, message.guild):
+        await bot.process_commands(message)
+        return
+
     content = (message.content or "").strip().lower()
 
+    # Allow payout and approved utility commands
     ALLOWED_THREAD_PREFIXES = (
         "%pay",
         "%undo",
@@ -275,6 +281,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    # Allow first human message (thread starter)
     try:
         human_messages = []
         async for msg in channel.history(oldest_first=True, limit=20):
@@ -287,11 +294,13 @@ async def on_message(message: discord.Message):
     except discord.HTTPException:
         pass
 
+    # ❌ React to invalid chatter
     try:
         await message.add_reaction("❌")
     except (discord.Forbidden, discord.HTTPException):
         pass
 
+    # Warning message
     try:
         await channel.send(
             f"{message.author.mention} Please keep this thread clean. "
