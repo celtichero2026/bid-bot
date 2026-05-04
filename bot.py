@@ -7,11 +7,13 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from asyncio import Lock
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 LEADER_ROLE_IDS = [
-    1415053351116079219,   # main server
-    1495844307666731069,   # test server role
+    1415053351116079219,  # main server
+    1495844307666731069,  # test server role
 ]
 
 ALLOWED_CHANNEL_IDS = [
@@ -35,9 +37,12 @@ intents.messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 bid_state: dict[int, dict] = {}
+bid_locks: dict[int, Lock] = {}
 
 
-def is_leader(member: discord.Member | discord.User | None, guild: discord.Guild | None) -> bool:
+def is_leader(
+    member: discord.Member | discord.User | None, guild: discord.Guild | None
+) -> bool:
     if member is None or guild is None:
         return False
     if not isinstance(member, discord.Member):
@@ -46,18 +51,18 @@ def is_leader(member: discord.Member | discord.User | None, guild: discord.Guild
 
 
 @bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
     traceback.print_exception(type(error), error, error.__traceback__)
 
     if interaction.response.is_done():
         await interaction.followup.send(
-            f"Error: {type(error).__name__}: {error}",
-            ephemeral=True
+            f"Error: {type(error).__name__}: {error}", ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            f"Error: {type(error).__name__}: {error}",
-            ephemeral=True
+            f"Error: {type(error).__name__}: {error}", ephemeral=True
         )
 
 
@@ -65,14 +70,22 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def get_bid_lock(thread_id: int) -> Lock:
+    if thread_id not in bid_locks:
+        bid_locks[thread_id] = Lock()
+    return bid_locks[thread_id]
+
+
 def count_user_bids(state: dict, user_id: int) -> int:
     return sum(
-        1 for entry in state.get("bid_log", [])
-        if entry.get("valid") and entry.get("bidder_id") == user_id
+        1
+        for entry in state.get("bid_log", [])
+        if entry.get("valid", False) and entry.get("bidder_id") == user_id
     )
 
 
@@ -137,6 +150,7 @@ def deserialize_state(raw: dict) -> dict[int, dict]:
 # Persistent state
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def save_state() -> None:
     ensure_data_dir()
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -161,7 +175,14 @@ def get_state(thread_id: int) -> dict | None:
     return bid_state.get(thread_id)
 
 
-def init_state(thread_id: int, toon: str, amount: int, min_bid: int, bidder_id: int, message_id: int | None) -> dict:
+def init_state(
+    thread_id: int,
+    toon: str,
+    amount: int,
+    min_bid: int,
+    bidder_id: int,
+    message_id: int | None,
+) -> dict:
     now = utcnow()
     outbid_inc = min_outbid_from_min_bid(min_bid)
 
@@ -188,6 +209,7 @@ def init_state(thread_id: int, toon: str, amount: int, min_bid: int, bidder_id: 
         },
         "bid_log": [
             {
+                "bid_number": 1,
                 "toon": toon,
                 "amount": amount,
                 "bidder_id": bidder_id,
@@ -225,9 +247,35 @@ def recalc_last_valid_bid(state: dict) -> None:
     state["current_bidder_id"] = 0
 
 
+def recalc_phase1_bidders(state: dict) -> None:
+    phase1_start = str_to_dt(state.get("phase1_start"))
+
+    if not phase1_start:
+        state["phase1_bidders"] = set()
+        return
+
+    cutoff = phase1_start + timedelta(hours=24)
+
+    valid_bidders = set()
+
+    for entry in state.get("bid_log", []):
+        if not entry.get("valid"):
+            continue
+
+        ts = str_to_dt(entry.get("timestamp"))
+        if not ts:
+            continue
+
+        if ts <= cutoff:
+            valid_bidders.add(entry["bidder_id"])
+
+    state["phase1_bidders"] = valid_bidders
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Bot lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 @bot.event
 async def on_ready():
@@ -241,6 +289,7 @@ async def on_ready():
 # ──────────────────────────────────────────────────────────────────────────────
 # Thread chat discouragement
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -318,6 +367,7 @@ async def on_message(message: discord.Message):
 # Background phase watcher
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 @tasks.loop(minutes=1)
 async def phase_checker():
     now = utcnow()
@@ -347,7 +397,9 @@ async def phase_checker():
             if not state["phase2_announced"]:
                 bidders = state.get("phase1_bidders", set())
                 opted_out = state.get("opted_out_bidders", set())
-                mentions = " ".join(f"<@{uid}>" for uid in bidders if uid not in opted_out)
+                mentions = " ".join(
+                    f"<@{uid}>" for uid in bidders if uid not in opted_out
+                )
 
                 if mentions:
                     msg = (
@@ -408,6 +460,7 @@ async def before_phase_checker():
 # Commands
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 @bot.tree.command(name="ping")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
@@ -419,11 +472,15 @@ async def ping(interaction: discord.Interaction):
     amount="Opening bid amount",
     min_bid="Minimum bid amount for this item",
 )
-async def open_bid(interaction: discord.Interaction, toon: str, amount: int, min_bid: int):
+async def open_bid(
+    interaction: discord.Interaction, toon: str, amount: int, min_bid: int
+):
     channel = interaction.channel
 
     if not is_allowed_channel(channel):
-        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
         return
 
     if channel is None:
@@ -474,156 +531,165 @@ async def open_bid(interaction: discord.Interaction, toon: str, amount: int, min
 
 @bot.tree.command(name="bid", description="Place an outbid")
 @app_commands.describe(
-    toon="The toon name you are bidding on",
-    amount="Your bid amount"
+    toon="The toon name you are bidding on", amount="Your bid amount"
 )
 async def bid(interaction: discord.Interaction, toon: str, amount: int):
     channel = interaction.channel
 
+    async def reply(message: str, ephemeral: bool = True):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(message, ephemeral=ephemeral)
+
     if not isinstance(channel, discord.Thread):
-        await interaction.response.send_message(
-            "Bids must be placed inside a bid thread.",
-            ephemeral=True
-        )
+        await reply("Bids must be placed inside a bid thread.")
         return
 
     if not is_allowed_channel(channel):
-        await interaction.response.send_message(
-            "This is not a valid bidding channel.",
-            ephemeral=True
-        )
+        await reply("This is not a valid bidding channel.")
         return
 
     state = get_state(channel.id)
     if state is None:
-        await interaction.response.send_message(
-            "No bid is open in this thread. Use `/open` first.",
-            ephemeral=True,
-        )
+        await reply("No bid is open in this thread. Use `/open` first.")
         return
 
-    if state["phase"] == 3 or state["closed"]:
-        await interaction.response.send_message(
-            "🔒 Bidding is closed for this item.",
-            ephemeral=True
-        )
-        return
+    lock = get_bid_lock(channel.id)
 
-    phase1_bidders = state.get("phase1_bidders", set())
-    if state["phase"] == 2 and phase1_bidders and interaction.user.id not in phase1_bidders:
-        await interaction.response.send_message(
-            "⏰ Bidding is in Phase 2 and restricted to users who placed a valid bid in the first 24 hours.",
-            ephemeral=True,
-        )
-        return
-
-    user_bid_count = count_user_bids(state, interaction.user.id)
-
-    if user_bid_count >= 7:
-        await interaction.response.send_message(
-            f"❌ You have reached the maximum of 7 bids for this item. ({user_bid_count}/7)",
-            ephemeral=True
-        )
-        return
-
-    if amount <= 0:
-        await interaction.response.send_message(
-            "Bid must be greater than 0.",
-            ephemeral=True
-        )
-        return
-
-    current = state["current_bid"]
-    min_bid = state["min_bid"]
-    min_outbid = state["outbid_inc"]
-
-    if current is None:
-        if amount < min_bid:
-            await interaction.response.send_message(
-                f"Opening bid must be at least {min_bid}.",
-                ephemeral=True
-            )
+    async with lock:
+        if state["phase"] == 3 or state["closed"]:
+            await reply("🔒 Bidding is closed for this item.")
             return
-    else:
-        required = current + min_outbid
-        if amount < required:
-            await interaction.response.send_message(
-                f"You must bid at least {required}.",
-                ephemeral=True
+
+        phase1_bidders = state.get("phase1_bidders", set())
+        if (
+            state["phase"] == 2
+            and phase1_bidders
+            and interaction.user.id not in phase1_bidders
+        ):
+            await reply(
+                "⏰ Bidding is in Phase 2 and restricted to users who placed a valid bid in the first 24 hours."
             )
             return
 
-    now_str = datetime.now(timezone.utc).isoformat()
+        user_bid_count = count_user_bids(state, interaction.user.id)
 
-    state["current_bid"] = amount
-    state["current_toon"] = toon
-    state["current_bidder_id"] = interaction.user.id
-    state["last_bid_time"] = now_str
-    state["phase1_bidders"].add(interaction.user.id)
+        if user_bid_count >= 7:
+            await reply(
+                f"❌ You have reached the maximum of 7 bids for this item. ({user_bid_count}/7)"
+            )
+            return
 
-    state["last_valid_bid"] = {
-        "toon": toon,
-        "amount": amount,
-        "bidder_id": interaction.user.id,
-        "message_id": None,
-        "timestamp": now_str,
-    }
+        if amount <= 0:
+            await reply("Bid must be greater than 0.")
+            return
 
-    state.setdefault("bid_log", []).append({
-        "toon": toon,
-        "amount": amount,
-        "bidder_id": interaction.user.id,
-        "message_id": None,
-        "timestamp": now_str,
-        "valid": True,
-        "reason": None,
-    })
+        current = state["current_bid"]
+        min_bid = state["min_bid"]
+        min_outbid = state["outbid_inc"]
 
-    save_state()
+        if current is None:
+            if amount < min_bid:
+                await reply(f"Opening bid must be at least {min_bid:,}.")
+                return
+        else:
+            required = current + min_outbid
+            if amount < required:
+                await reply(f"You must bid at least {required:,}.")
+                return
 
-    remaining = 7 - (user_bid_count + 1)
+        now_str = datetime.now(timezone.utc).isoformat()
+        bid_number = len(state.get("bid_log", [])) + 1
 
-    participants = state.get("phase1_bidders", set())
-    opted_out = state.get("opted_out_bidders", set())
-    mentions = " ".join(
-        f"<@{uid}>"
-        for uid in participants
-        if uid not in opted_out
-    )
+        state["current_bid"] = amount
+        state["current_toon"] = toon
+        state["current_bidder_id"] = interaction.user.id
+        state["last_bid_time"] = now_str
 
-    await interaction.response.send_message(
-        f"💰 **New Bid!**\n"
-        f"__**{toon}**__ → {amount:,}\n"
-        f"Next min: {amount + min_outbid:,}\n"
-        f"Bids remaining: {remaining}\n"
-        f"{mentions}",
-        allowed_mentions=discord.AllowedMentions(users=True),
-    )
+        phase1_start = str_to_dt(state.get("phase1_start"))
+        if phase1_start and datetime.now(timezone.utc) <= phase1_start + timedelta(
+            hours=24
+        ):
+            state["phase1_bidders"].add(interaction.user.id)
+
+        state["last_valid_bid"] = {
+            "bid_number": bid_number,
+            "toon": toon,
+            "amount": amount,
+            "bidder_id": interaction.user.id,
+            "message_id": None,
+            "timestamp": now_str,
+        }
+
+        state.setdefault("bid_log", []).append(
+            {
+                "bid_number": bid_number,
+                "toon": toon,
+                "amount": amount,
+                "bidder_id": interaction.user.id,
+                "message_id": None,
+                "timestamp": now_str,
+                "valid": True,
+                "reason": None,
+            }
+        )
+
+        remaining = 7 - (user_bid_count + 1)
+
+        participants = state.get("phase1_bidders", set())
+        opted_out = state.get("opted_out_bidders", set())
+        mentions = " ".join(f"<@{uid}>" for uid in participants if uid not in opted_out)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"💰 **New Bid #{bid_number}!**\n"
+                f"__**{toon}**__ → {amount:,}\n"
+                f"Next min: {amount + min_outbid:,}\n"
+                f"Bids remaining: {remaining}\n"
+                f"{mentions}",
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        else:
+            await interaction.followup.send(
+                f"💰 **New Bid #{bid_number}!**\n"
+                f"__**{toon}**__ → {amount:,}\n"
+                f"Next min: {amount + min_outbid:,}\n"
+                f"Bids remaining: {remaining}\n"
+                f"{mentions}",
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+
+        sent = await interaction.original_response()
+
+        state["last_valid_bid"]["message_id"] = sent.id
+        state["bid_log"][-1]["message_id"] = sent.id
+
+        save_state()
 
 
-@bot.tree.command(name="out", description="Opt out of future bid mentions in this thread")
+@bot.tree.command(
+    name="out", description="Opt out of future bid mentions in this thread"
+)
 async def out(interaction: discord.Interaction):
     channel = interaction.channel
 
     if not isinstance(channel, discord.Thread):
         await interaction.response.send_message(
-            "Use this inside a bid thread.",
-            ephemeral=True
+            "Use this inside a bid thread.", ephemeral=True
         )
         return
 
     if not is_allowed_channel(channel):
         await interaction.response.send_message(
-            "Use this in bid channels only.",
-            ephemeral=True
+            "Use this in bid channels only.", ephemeral=True
         )
         return
 
     state = get_state(channel.id)
     if state is None:
         await interaction.response.send_message(
-            "No bid is open in this thread.",
-            ephemeral=True
+            "No bid is open in this thread.", ephemeral=True
         )
         return
 
@@ -632,15 +698,77 @@ async def out(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "You are out. You will not be mentioned in future bid updates for this thread.",
-        ephemeral=True
+        ephemeral=True,
     )
+
+
+@bot.tree.command(name="history", description="Show bid history for this thread")
+async def history(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No bid is open in this thread.", ephemeral=True
+        )
+        return
+
+    bid_log = state.get("bid_log", [])
+
+    if not bid_log:
+        await interaction.response.send_message("No bids recorded yet.", ephemeral=True)
+        return
+
+    lines = ["📜 **Bid History**"]
+
+    for entry in bid_log[-20:]:
+        bid_number = entry.get("bid_number", "?")
+        toon = entry.get("toon", "Unknown")
+        amount = entry.get("amount", 0)
+        valid = entry.get("valid", False)
+
+        status = "✅"
+        extra = ""
+
+        if not valid:
+            status = "❌"
+            reason = entry.get("reason")
+            if reason:
+                extra = f" — {reason}"
+
+        elif entry.get("corrected"):
+            status = "✏️"
+            old_amount = entry.get("old_amount")
+            reason = entry.get("correction_reason")
+            if old_amount:
+                extra = f" — was {old_amount:,}"
+            if reason:
+                extra += f" — {reason}"
+
+        lines.append(f"{status} **#{bid_number}** — **{toon}**: **{amount:,}**{extra}")
+
+    if len(bid_log) > 20:
+        lines.append(f"\nShowing last 20 of {len(bid_log)} bids.")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="review", description="Flag a concern for leaders")
 @app_commands.describe(reason="Briefly describe the issue")
 async def review(interaction: discord.Interaction, reason: str):
     if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
         return
 
     if interaction.guild is None:
@@ -658,7 +786,9 @@ async def review(interaction: discord.Interaction, reason: str):
 @bot.tree.command(name="bidinfo", description="Show current bid info for this thread")
 async def bidinfo(interaction: discord.Interaction):
     if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
         return
 
     channel = interaction.channel
@@ -668,7 +798,9 @@ async def bidinfo(interaction: discord.Interaction):
 
     state = get_state(channel.id)
     if state is None:
-        await interaction.response.send_message("No bid is open in this thread.", ephemeral=True)
+        await interaction.response.send_message(
+            "No bid is open in this thread.", ephemeral=True
+        )
         return
 
     now = utcnow()
@@ -708,15 +840,21 @@ async def bidinfo(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="setminbid", description="Change the minimum bid for this thread")
+@bot.tree.command(
+    name="setminbid", description="Change the minimum bid for this thread"
+)
 @app_commands.describe(min_bid="Corrected minimum bid")
 async def setminbid(interaction: discord.Interaction, min_bid: int):
     if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
         return
 
     if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message("Only leaders can adjust the minimum bid.", ephemeral=True)
+        await interaction.response.send_message(
+            "Only leaders can adjust the minimum bid.", ephemeral=True
+        )
         return
 
     channel = interaction.channel
@@ -726,11 +864,15 @@ async def setminbid(interaction: discord.Interaction, min_bid: int):
 
     state = get_state(channel.id)
     if state is None:
-        await interaction.response.send_message("No open auction found in this thread.", ephemeral=True)
+        await interaction.response.send_message(
+            "No open auction found in this thread.", ephemeral=True
+        )
         return
 
     if min_bid <= 0:
-        await interaction.response.send_message("Minimum bid must be greater than 0.", ephemeral=True)
+        await interaction.response.send_message(
+            "Minimum bid must be greater than 0.", ephemeral=True
+        )
         return
 
     state["min_bid"] = min_bid
@@ -743,15 +885,25 @@ async def setminbid(interaction: discord.Interaction, min_bid: int):
     )
 
 
-@bot.tree.command(name="invalidate_lastbid", description="Invalidate the last valid bid")
-@app_commands.describe(reason="Why the last valid bid is being invalidated")
-async def invalidate_lastbid(interaction: discord.Interaction, reason: str):
+@bot.tree.command(name="correctbid", description="Correct the amount on a specific bid")
+@app_commands.describe(
+    bid_number="The bid number to correct",
+    amount="The corrected bid amount",
+    reason="Why this bid is being corrected",
+)
+async def correctbid(
+    interaction: discord.Interaction, bid_number: int, amount: int, reason: str
+):
     if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
         return
 
     if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message("Only leaders can invalidate bids.", ephemeral=True)
+        await interaction.response.send_message(
+            "Only leaders can correct bids.", ephemeral=True
+        )
         return
 
     channel = interaction.channel
@@ -761,28 +913,151 @@ async def invalidate_lastbid(interaction: discord.Interaction, reason: str):
 
     state = get_state(channel.id)
     if state is None:
-        await interaction.response.send_message("No open auction found in this thread.", ephemeral=True)
+        await interaction.response.send_message(
+            "No open auction found in this thread.", ephemeral=True
+        )
         return
 
-    last_valid = state.get("last_valid_bid")
-    if not last_valid:
-        await interaction.response.send_message("No valid bid found to invalidate.", ephemeral=True)
+    if amount <= 0:
+        await interaction.response.send_message(
+            "Corrected amount must be greater than 0.", ephemeral=True
+        )
         return
 
-    target_message_id = last_valid.get("message_id")
-    invalidated = False
+    target = None
 
-    for entry in reversed(state["bid_log"]):
-        if entry.get("valid"):
-            entry["valid"] = False
-            entry["reason"] = f"Invalidated by leader: {reason}"
-            invalidated = True
+    for entry in state.get("bid_log", []):
+        if entry.get("bid_number") == bid_number:
+            target = entry
             break
 
-    if not invalidated:
-        await interaction.response.send_message("Could not invalidate last valid bid.", ephemeral=True)
+    if target is None:
+        await interaction.response.send_message(
+            f"No bid found with bid number **#{bid_number}**.", ephemeral=True
+        )
         return
 
+    if not target.get("valid"):
+        await interaction.response.send_message(
+            f"Bid **#{bid_number}** is invalid. Invalidate corrections should stay separate.",
+            ephemeral=True,
+        )
+        return
+
+    old_amount = target["amount"]
+
+    # Check previous valid bid before this one
+    previous_valid = None
+    for entry in state.get("bid_log", []):
+        if entry.get("bid_number") == bid_number:
+            break
+        if entry.get("valid"):
+            previous_valid = entry
+
+    min_outbid = state["outbid_inc"]
+
+    if previous_valid:
+        required = previous_valid["amount"] + min_outbid
+        if amount < required:
+            await interaction.response.send_message(
+                f"❌ Corrected amount is too low.\n"
+                f"Previous valid bid was **{previous_valid['amount']:,}**.\n"
+                f"Corrected bid must be at least **{required:,}**.",
+                ephemeral=True,
+            )
+            return
+    else:
+        min_bid = state["min_bid"]
+        if amount < min_bid:
+            await interaction.response.send_message(
+                f"❌ Corrected amount is below the minimum bid of **{min_bid:,}**.",
+                ephemeral=True,
+            )
+            return
+
+    target["amount"] = amount
+    target["corrected"] = True
+    target["correction_reason"] = reason
+    target["old_amount"] = old_amount
+
+    target_message_id = target.get("message_id")
+    if target_message_id:
+        try:
+            msg = await channel.fetch_message(target_message_id)
+            await msg.add_reaction("✏️")
+        except discord.HTTPException:
+            pass
+
+    recalc_last_valid_bid(state)
+    recalc_phase1_bidders(state)
+    save_state()
+
+    new_last = state.get("last_valid_bid")
+
+    await interaction.response.send_message(
+        f"✏️ Bid **#{bid_number}** corrected.\n"
+        f"Old amount: **{old_amount:,}**\n"
+        f"New amount: **{amount:,}**\n"
+        f"Reason: {reason}\n"
+        f"Current valid bid: **{new_last['toon']} {new_last['amount']:,}**"
+    )
+
+
+@bot.tree.command(
+    name="invalidate", description="Invalidate a specific bid by bid number"
+)
+@app_commands.describe(
+    bid_number="The bid number to invalidate",
+    reason="Why this bid is being invalidated",
+)
+async def invalidate(interaction: discord.Interaction, bid_number: int, reason: str):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can invalidate bids.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.", ephemeral=True
+        )
+        return
+
+    target = None
+
+    for entry in state.get("bid_log", []):
+        if entry.get("bid_number") == bid_number:
+            target = entry
+            break
+
+    if target is None:
+        await interaction.response.send_message(
+            f"No bid found with bid number **#{bid_number}**.", ephemeral=True
+        )
+        return
+
+    if not target.get("valid"):
+        await interaction.response.send_message(
+            f"Bid **#{bid_number}** is already invalid.", ephemeral=True
+        )
+        return
+
+    target["valid"] = False
+    target["reason"] = f"Invalidated by leader: {reason}"
+
+    target_message_id = target.get("message_id")
     if target_message_id:
         try:
             msg = await channel.fetch_message(target_message_id)
@@ -791,28 +1066,37 @@ async def invalidate_lastbid(interaction: discord.Interaction, reason: str):
             pass
 
     recalc_last_valid_bid(state)
+    recalc_phase1_bidders(state)
     save_state()
 
     new_last = state.get("last_valid_bid")
+
     if new_last:
         await interaction.response.send_message(
-            f"❌ Last valid bid invalidated.\n"
-            f"New last valid bid: **{new_last['toon']} {new_last['amount']:,}**"
+            f"❌ Bid **#{bid_number}** invalidated.\n"
+            f"Reason: {reason}\n"
+            f"Current valid bid: **{new_last['toon']} {new_last['amount']:,}**"
         )
     else:
         await interaction.response.send_message(
-            "❌ Last valid bid invalidated. There are no remaining valid bids."
+            f"❌ Bid **#{bid_number}** invalidated.\n"
+            f"Reason: {reason}\n"
+            "There are no remaining valid bids."
         )
 
 
 @bot.tree.command(name="closebid", description="Force close the current bid thread")
 async def closebid(interaction: discord.Interaction):
     if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
         return
 
     if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message("Only leaders can close bids.", ephemeral=True)
+        await interaction.response.send_message(
+            "Only leaders can close bids.", ephemeral=True
+        )
         return
 
     channel = interaction.channel
@@ -822,7 +1106,9 @@ async def closebid(interaction: discord.Interaction):
 
     state = get_state(channel.id)
     if state is None:
-        await interaction.response.send_message("No open auction found in this thread.", ephemeral=True)
+        await interaction.response.send_message(
+            "No open auction found in this thread.", ephemeral=True
+        )
         return
 
     state["phase"] = 3
@@ -838,7 +1124,9 @@ async def closebid(interaction: discord.Interaction):
             f"Cash out with: `%pay {last_valid['toon']} {last_valid['amount']}`"
         )
     else:
-        await interaction.response.send_message("🔒 Bid closed manually. No valid bids recorded.")
+        await interaction.response.send_message(
+            "🔒 Bid closed manually. No valid bids recorded."
+        )
 
     if isinstance(channel, discord.Thread):
         try:
