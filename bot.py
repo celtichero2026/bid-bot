@@ -114,7 +114,7 @@ def is_allowed_channel(channel) -> bool:
 
 
 def min_outbid_from_min_bid(min_bid: int) -> int:
-    return max(1, int(min_bid * OUTBID_INCREMENT))
+    return max(10, int(min_bid * OUTBID_INCREMENT))
 
 
 def phase_label(phase: int) -> str:
@@ -284,6 +284,9 @@ async def on_ready():
     if not phase_checker.is_running():
         phase_checker.start()
     print(f"Logged in as {bot.user}")
+    print("Phase checker running:", phase_checker.is_running())
+    print("Loaded bid states:", len(bid_state))
+    
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -299,27 +302,41 @@ async def on_message(message: discord.Message):
 
     channel = message.channel
 
+    # Only monitor threads
     if not isinstance(channel, discord.Thread):
         await bot.process_commands(message)
         return
 
+    # Only monitor allowed bid channels
     if not is_allowed_channel(channel):
         await bot.process_commands(message)
         return
 
+    # Only monitor active bid threads
     state = get_state(channel.id)
     if state is None:
         await bot.process_commands(message)
         return
 
-    # ✅ Allow normal comments from leaders
+    content = (message.content or "").strip().lower()
+
+    # User opts out of mentions
+    if content == "out":
+        state.setdefault("opted_out_bidders", set()).add(message.author.id)
+        save_state()
+
+        await channel.send(
+            f"🚪 {message.author.mention} is out and will not be mentioned in future bid updates.",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+        return
+
+    # Allow leader comments
     if is_leader(message.author, message.guild):
         await bot.process_commands(message)
         return
 
-    content = (message.content or "").strip().lower()
-
-    # Allow payout and approved utility commands
+    # Allow approved utility commands
     ALLOWED_THREAD_PREFIXES = (
         "%pay",
         "%undo",
@@ -330,20 +347,12 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Allow first human message (thread starter)
-    try:
-        human_messages = []
-        async for msg in channel.history(oldest_first=True, limit=20):
-            if not msg.author.bot:
-                human_messages.append(msg.id)
+    # Allow slash command messages
+    if content.startswith("/"):
+        await bot.process_commands(message)
+        return
 
-        if human_messages and message.id == human_messages[0]:
-            await bot.process_commands(message)
-            return
-    except discord.HTTPException:
-        pass
-
-    # ❌ React to invalid chatter
+    # React to chatter
     try:
         await message.add_reaction("❌")
     except (discord.Forbidden, discord.HTTPException):
@@ -353,7 +362,7 @@ async def on_message(message: discord.Message):
     try:
         await channel.send(
             f"{message.author.mention} Please keep this thread clean. "
-            "Use `/bid` to bid, `/review` for concerns, `/out` to stop future mentions, or approved mod payout commands.",
+            "Use `/bid` to bid, `/review` for concerns, `out` to stop future mentions, or approved mod payout commands.",
             delete_after=12,
             allowed_mentions=discord.AllowedMentions(users=True),
         )
@@ -374,82 +383,94 @@ async def phase_checker():
     dirty = False
 
     for thread_id, state in list(bid_state.items()):
+
+        print(f"[PHASE CHECK] Thread {thread_id} | Phase: {state['phase']}")
+
+        # Skip already closed bids
         if state.get("closed") or state.get("phase") == 3:
             continue
 
         thread = bot.get_channel(thread_id)
+
         if thread is None:
             try:
                 thread = await bot.fetch_channel(thread_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 continue
 
-        phase1_start = str_to_dt(state["phase1_start"])
-        last_bid_time = str_to_dt(state["last_bid_time"])
+        phase1_start = str_to_dt(state.get("phase1_start"))
+        last_bid_time = str_to_dt(state.get("last_bid_time"))
 
         if phase1_start is None or last_bid_time is None:
             continue
 
+        # ─────────────────────────────────────────────
+        # Move to Phase 2 after 24h
+        # ─────────────────────────────────────────────
         if state["phase"] == 1 and now >= phase1_start + timedelta(hours=24):
+
             state["phase"] = 2
             dirty = True
 
-            if not state["phase2_announced"]:
+            if not state.get("phase2_announced", False):
+
                 bidders = state.get("phase1_bidders", set())
                 opted_out = state.get("opted_out_bidders", set())
+
                 mentions = " ".join(
-                    f"<@{uid}>" for uid in bidders if uid not in opted_out
+                    f"<@{uid}>"
+                    for uid in bidders
+                    if uid not in opted_out
                 )
 
                 if mentions:
-                    msg = (
-                        "⏰ **Phase 2 — Restricted Bidding**\n"
-                        "Only users who placed a valid bid in the first 24 hours can keep bidding.\n"
-                        f"{mentions}"
-                    )
                     await thread.send(
-                        msg,
+                        "⏰ **Phase 2 — Restricted Bidding**\n"
+                        "Only users who placed a valid bid in the first 24 hours can continue bidding.\n"
+                        f"{mentions}",
                         allowed_mentions=discord.AllowedMentions(users=True),
                     )
                 else:
                     await thread.send(
                         "⏰ **Phase 2 — Restricted Bidding**\n"
-                        "No active phase 1 bidders remain for mentions."
+                        "No eligible phase 1 bidders remain."
                     )
 
                 state["phase2_announced"] = True
                 dirty = True
 
+        # ─────────────────────────────────────────────
+        # Close bidding 12h after last valid phase 2 bid
+        # ─────────────────────────────────────────────
         if state["phase"] == 2 and now >= last_bid_time + timedelta(hours=12):
+
             state["phase"] = 3
             state["closed"] = True
             dirty = True
 
-            if not state["closed_announced"]:
+            if not state.get("closed_announced", False):
+
                 last_valid = state.get("last_valid_bid")
+
                 if last_valid:
                     toon = last_valid["toon"]
                     amount = last_valid["amount"]
+
                     await thread.send(
                         "🔒 **Bidding Closed**\n"
                         f"Final bid: **{toon}** — **{amount:,}**\n"
                         f"Cash out with: `%pay {toon} {amount}`"
                     )
                 else:
-                    await thread.send("🔒 **Bidding Closed** — No valid bids recorded.")
-
-                try:
-                    if isinstance(thread, discord.Thread):
-                        await thread.edit(locked=True)
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+                    await thread.send(
+                        "🔒 **Bidding Closed** — No valid bids recorded."
+                    )
 
                 state["closed_announced"] = True
                 dirty = True
 
     if dirty:
         save_state()
-
 
 @phase_checker.before_loop
 async def before_phase_checker():
@@ -494,9 +515,9 @@ async def open_bid(
         )
         return
 
-    if min_bid <= 0 or amount <= 0:
+    if min_bid < 0 or amount < 0:
         await interaction.response.send_message(
-            "Amounts must be greater than 0.",
+            "Amounts cannot be negative.",
             ephemeral=True,
         )
         return
@@ -581,8 +602,8 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
             )
             return
 
-        if amount <= 0:
-            await reply("Bid must be greater than 0.")
+        if amount < 0:
+            await reply("Bid cannot be negative.")
             return
 
         current = state["current_bid"]
@@ -666,40 +687,6 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
         state["bid_log"][-1]["message_id"] = sent.id
 
         save_state()
-
-
-@bot.tree.command(
-    name="out", description="Opt out of future bid mentions in this thread"
-)
-async def out(interaction: discord.Interaction):
-    channel = interaction.channel
-
-    if not isinstance(channel, discord.Thread):
-        await interaction.response.send_message(
-            "Use this inside a bid thread.", ephemeral=True
-        )
-        return
-
-    if not is_allowed_channel(channel):
-        await interaction.response.send_message(
-            "Use this in bid channels only.", ephemeral=True
-        )
-        return
-
-    state = get_state(channel.id)
-    if state is None:
-        await interaction.response.send_message(
-            "No bid is open in this thread.", ephemeral=True
-        )
-        return
-
-    state.setdefault("opted_out_bidders", set()).add(interaction.user.id)
-    save_state()
-
-    await interaction.response.send_message(
-        "You are out. You will not be mentioned in future bid updates for this thread.",
-        ephemeral=True,
-    )
 
 
 @bot.tree.command(name="history", description="Show bid history for this thread")
@@ -869,9 +856,9 @@ async def setminbid(interaction: discord.Interaction, min_bid: int):
         )
         return
 
-    if min_bid <= 0:
+    if min_bid < 0:
         await interaction.response.send_message(
-            "Minimum bid must be greater than 0.", ephemeral=True
+            "Minimum bid cannot be negative.", ephemeral=True
         )
         return
 
@@ -884,6 +871,106 @@ async def setminbid(interaction: discord.Interaction, min_bid: int):
         f"Min outbid is now **{state['outbid_inc']:,}**."
     )
 
+@bot.tree.command(name="all_in", description="Bid all remaining EKP even if below normal min outbid")
+@app_commands.describe(
+    toon="The toon name you are bidding on",
+    amount="Your all-in bid amount"
+)
+async def all_in(interaction: discord.Interaction, toon: str, amount: int):
+    channel = interaction.channel
+
+    async def reply(message: str, ephemeral: bool = True):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(message, ephemeral=ephemeral)
+
+    if not isinstance(channel, discord.Thread):
+        await reply("All-in bids must be placed inside a bid thread.")
+        return
+
+    if not is_allowed_channel(channel):
+        await reply("This is not a valid bidding channel.")
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await reply("No bid is open in this thread. Use `/open` first.")
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state["phase"] == 3 or state["closed"]:
+            await reply("🔒 Bidding is closed for this item.")
+            return
+
+        phase1_bidders = state.get("phase1_bidders", set())
+        if state["phase"] == 2 and phase1_bidders and interaction.user.id not in phase1_bidders:
+            await reply("⏰ Phase 2 is restricted to users who bid in the first 24 hours.")
+            return
+
+        user_bid_count = count_user_bids(state, interaction.user.id)
+        if user_bid_count >= 7:
+            await reply("❌ You have reached the maximum of 7 bids for this item.")
+            return
+
+        if amount < 0:
+            await reply("Bid cannot be negative.")
+            return
+
+        current = state["current_bid"]
+
+        if amount <= current:
+            await reply(f"All-in bid must still be higher than the current bid of **{current:,}**.")
+            return
+
+        now_str = utcnow().isoformat()
+        bid_number = len(state.get("bid_log", [])) + 1
+
+        state["current_bid"] = amount
+        state["current_toon"] = toon
+        state["current_bidder_id"] = interaction.user.id
+        state["last_bid_time"] = now_str
+
+        phase1_start = str_to_dt(state.get("phase1_start"))
+        if phase1_start and utcnow() <= phase1_start + timedelta(hours=24):
+            state["phase1_bidders"].add(interaction.user.id)
+
+        entry = {
+            "bid_number": bid_number,
+            "toon": toon,
+            "amount": amount,
+            "bidder_id": interaction.user.id,
+            "message_id": None,
+            "timestamp": now_str,
+            "valid": True,
+            "reason": "ALL IN",
+            "all_in": True,
+        }
+
+        state.setdefault("bid_log", []).append(entry)
+        state["last_valid_bid"] = entry
+
+        remaining = 7 - (user_bid_count + 1)
+
+        participants = state.get("phase1_bidders", set())
+        opted_out = state.get("opted_out_bidders", set())
+        mentions = " ".join(f"<@{uid}>" for uid in participants if uid not in opted_out)
+
+        await interaction.response.send_message(
+            f"🔥 **ALL IN Bid #{bid_number}!**\n"
+            f"__**{toon}**__ → {amount:,}\n"
+            f"Bids remaining: {remaining}\n"
+            f"{mentions}",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+        sent = await interaction.original_response()
+        state["bid_log"][-1]["message_id"] = sent.id
+        state["last_valid_bid"]["message_id"] = sent.id
+
+        save_state()
 
 @bot.tree.command(name="correctbid", description="Correct the amount on a specific bid")
 @app_commands.describe(
@@ -918,9 +1005,9 @@ async def correctbid(
         )
         return
 
-    if amount <= 0:
+    if amount < 0:
         await interaction.response.send_message(
-            "Corrected amount must be greater than 0.", ephemeral=True
+            "Corrected amount cannot be negative.", ephemeral=True
         )
         return
 
@@ -1127,12 +1214,6 @@ async def closebid(interaction: discord.Interaction):
         await interaction.response.send_message(
             "🔒 Bid closed manually. No valid bids recorded."
         )
-
-    if isinstance(channel, discord.Thread):
-        try:
-            await channel.edit(locked=True)
-        except discord.HTTPException:
-            pass
 
 
 bot.run(TOKEN)
