@@ -1,6 +1,7 @@
 import os
 import json
 import traceback
+import random
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -38,6 +39,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 bid_state: dict[int, dict] = {}
 bid_locks: dict[int, Lock] = {}
+
+roll_state: dict[int, dict] = {}
+roll_views_registered = False
 
 
 def is_leader(
@@ -166,50 +170,92 @@ def phase_label(phase: int) -> str:
     }.get(phase, "Unknown")
 
 
-def serialize_state() -> dict:
+def serialize_bid_state() -> dict:
     payload = {}
+
     for thread_id, state in bid_state.items():
         copy_state = dict(state)
         copy_state["phase1_bidders"] = list(state.get("phase1_bidders", set()))
         copy_state["opted_out_bidders"] = list(state.get("opted_out_bidders", set()))
         payload[str(thread_id)] = copy_state
+
     return payload
 
 
-def deserialize_state(raw: dict) -> dict[int, dict]:
+def deserialize_bid_state(raw: dict) -> dict[int, dict]:
     restored = {}
+
     for thread_id_str, state in raw.items():
         restored[int(thread_id_str)] = {
             **state,
             "phase1_bidders": set(state.get("phase1_bidders", [])),
             "opted_out_bidders": set(state.get("opted_out_bidders", [])),
         }
+
     return restored
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Persistent state
-# ──────────────────────────────────────────────────────────────────────────────
+def serialize_roll_state() -> dict:
+    return {
+        str(roll_id): state
+        for roll_id, state in roll_state.items()
+    }
+
+
+def deserialize_roll_state(raw: dict) -> dict[int, dict]:
+    restored = {}
+
+    for roll_id_str, state in raw.items():
+        restored[int(roll_id_str)] = state
+
+    return restored
+
+
+def serialize_state() -> dict:
+    return {
+        "version": 2,
+        "bid_state": serialize_bid_state(),
+        "roll_state": serialize_roll_state(),
+    }
 
 
 def save_state() -> None:
     ensure_data_dir()
+
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(serialize_state(), f, indent=2)
 
 
 def load_state() -> None:
-    global bid_state
+    global bid_state, roll_state
+
     ensure_data_dir()
 
     if not os.path.exists(DATA_FILE):
         bid_state = {}
+        roll_state = {}
         return
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    bid_state = deserialize_state(raw)
+    # New format
+    if isinstance(raw, dict) and "bid_state" in raw:
+        bid_state = deserialize_bid_state(raw.get("bid_state", {}))
+        roll_state = deserialize_roll_state(raw.get("roll_state", {}))
+        return
+
+    # Old format fallback — protects your current live bid_state.json
+    bid_state = deserialize_bid_state(raw)
+    roll_state = {}
+
+
+def get_state(thread_id: int) -> dict | None:
+    return bid_state.get(thread_id)
+
+
+def get_roll_state(roll_id: int) -> dict | None:
+    return roll_state.get(roll_id)
 
 
 def get_state(thread_id: int) -> dict | None:
@@ -312,7 +358,373 @@ def recalc_phase1_bidders(state: dict) -> None:
 
     state["phase1_bidders"] = valid_bidders
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Roll helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
+
+def display_time_left(closes_at_text: str | None) -> str:
+    closes_at = str_to_dt(closes_at_text)
+
+    if not closes_at:
+        return "Unknown"
+
+    delta = closes_at - utcnow()
+    total = max(int(delta.total_seconds()), 0)
+
+    hours, remainder = divmod(total, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    return f"{hours}h {minutes}m"
+
+
+def get_sorted_rolls(state: dict) -> list[dict]:
+    rolls = list(state.get("rolls", {}).values())
+
+    return sorted(
+        rolls,
+        key=lambda item: (
+            -int(item.get("roll", -1)),
+            item.get("timestamp", ""),
+        ),
+    )
+
+
+def build_roll_panel_content(state: dict, roll_id: int) -> str:
+    title = state.get("title", "Roll")
+    closed = state.get("closed", False)
+    rolls = state.get("rolls", {})
+    sorted_rolls = get_sorted_rolls(state)
+
+    status = "Closed" if closed else "Open"
+    time_left = "Closed" if closed else display_time_left(state.get("closes_at"))
+
+    lines = [
+        f"🎲 **Roll {status} — {title}**",
+        f"Roll ID: `{roll_id}`",
+        "",
+        "Click **Roll** to roll 0–100.",
+        "",
+        "**Rules:**",
+        "• 1 roll per person",
+        "• Highest roll wins",
+        f"• Time left: **{time_left}**",
+        f"• Total rolls: **{len(rolls)}**",
+    ]
+
+    if sorted_rolls:
+        top = sorted_rolls[0]
+        lines.extend(
+            [
+                "",
+                f"Current highest: **{top.get('display_name', 'Unknown')} — {top.get('roll')}**",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def build_roll_info_content(state: dict, roll_id: int, viewer_id: int | None = None) -> str:
+    title = state.get("title", "Roll")
+    closed = state.get("closed", False)
+    rolls = state.get("rolls", {})
+    sorted_rolls = get_sorted_rolls(state)
+
+    status = "Closed" if closed else "Open"
+    time_left = "Closed" if closed else display_time_left(state.get("closes_at"))
+
+    lines = [
+        f"📊 **Roll Info — {title}**",
+        f"Roll ID: `{roll_id}`",
+        f"Status: **{status}**",
+        f"Time Left: **{time_left}**",
+        f"Total Rolls: **{len(rolls)}**",
+    ]
+
+    if sorted_rolls:
+        highest_value = sorted_rolls[0].get("roll")
+        winners = [
+            roll
+            for roll in sorted_rolls
+            if roll.get("roll") == highest_value
+        ]
+
+        if len(winners) == 1:
+            winner = winners[0]
+            lines.extend(
+                [
+                    "",
+                    f"Highest Roll: **{winner.get('display_name', 'Unknown')} — {winner.get('roll')}**",
+                ]
+            )
+        else:
+            names = ", ".join(
+                winner.get("display_name", "Unknown")
+                for winner in winners
+            )
+            lines.extend(
+                [
+                    "",
+                    f"Highest Roll: **{highest_value}**",
+                    f"Tied: **{names}**",
+                ]
+            )
+
+    if viewer_id is not None:
+        viewer_roll = rolls.get(str(viewer_id))
+
+        lines.append("")
+
+        if viewer_roll:
+            lines.append(
+                f"Your Roll: **{viewer_roll.get('display_name', 'You')} — {viewer_roll.get('roll')}**"
+            )
+        else:
+            lines.append("Your Roll: **Not rolled yet**")
+
+    if sorted_rolls:
+        lines.append("")
+        lines.append("**Top Rolls:**")
+
+        for index, roll in enumerate(sorted_rolls[:20], start=1):
+            lines.append(
+                f"{index}. **{roll.get('display_name', 'Unknown')}** — {roll.get('roll')}"
+            )
+
+        if len(sorted_rolls) > 20:
+            lines.append(f"\nShowing top 20 of {len(sorted_rolls)} rolls.")
+
+    return "\n".join(lines)
+
+
+def build_roll_closed_content(state: dict, roll_id: int) -> str:
+    title = state.get("title", "Roll")
+    sorted_rolls = get_sorted_rolls(state)
+
+    lines = [
+        f"🏁 **Roll Closed — {title}**",
+        f"Roll ID: `{roll_id}`",
+    ]
+
+    if not sorted_rolls:
+        lines.append("")
+        lines.append("No rolls recorded.")
+        return "\n".join(lines)
+
+    highest_value = sorted_rolls[0].get("roll")
+    winners = [
+        roll
+        for roll in sorted_rolls
+        if roll.get("roll") == highest_value
+    ]
+
+    lines.append("")
+
+    if len(winners) == 1:
+        winner = winners[0]
+        lines.append(
+            f"Winner: **{winner.get('display_name', 'Unknown')} — {winner.get('roll')}**"
+        )
+    else:
+        names = ", ".join(
+            winner.get("display_name", "Unknown")
+            for winner in winners
+        )
+        lines.append(f"Tie: **{names}** — **{highest_value}**")
+
+    lines.append("")
+    lines.append("**Top Rolls:**")
+
+    for index, roll in enumerate(sorted_rolls[:10], start=1):
+        lines.append(
+            f"{index}. **{roll.get('display_name', 'Unknown')}** — {roll.get('roll')}"
+        )
+
+    if len(sorted_rolls) > 10:
+        lines.append(f"\nShowing top 10 of {len(sorted_rolls)} rolls.")
+
+    return "\n".join(lines)
+
+
+async def close_roll_window(roll_id: int, announce: bool = True) -> tuple[bool, str]:
+    state = get_roll_state(roll_id)
+
+    if state is None:
+        return False, "Roll window not found."
+
+    if state.get("closed"):
+        return False, "Roll window is already closed."
+
+    state["closed"] = True
+    state["closed_at"] = dt_to_str(utcnow())
+    save_state()
+
+    channel_id = state.get("channel_id")
+    channel = bot.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return True, "Roll closed, but I could not fetch the channel."
+
+    try:
+        message = await channel.fetch_message(roll_id)
+        await message.edit(
+            content=build_roll_panel_content(state, roll_id),
+            view=None,
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    if announce:
+        try:
+            await channel.send(
+                build_roll_closed_content(state, roll_id),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    return True, "Roll window closed."
+
+
+async def handle_roll_button(interaction: discord.Interaction):
+    if interaction.message is None:
+        await interaction.response.send_message(
+            "Roll panel not found.",
+            ephemeral=True,
+        )
+        return
+
+    roll_id = interaction.message.id
+    state = get_roll_state(roll_id)
+
+    if state is None:
+        await interaction.response.send_message(
+            "This roll window was not found.",
+            ephemeral=True,
+        )
+        return
+
+    closes_at = str_to_dt(state.get("closes_at"))
+
+    if state.get("closed") or (closes_at and utcnow() >= closes_at):
+        if not state.get("closed"):
+            await close_roll_window(roll_id, announce=True)
+
+        await interaction.response.send_message(
+            "This roll window is closed.",
+            ephemeral=True,
+        )
+        return
+
+    user_id = str(interaction.user.id)
+    rolls = state.setdefault("rolls", {})
+
+    if user_id in rolls:
+        existing = rolls[user_id]
+
+        await interaction.response.send_message(
+            f"❌ You already rolled for **{state.get('title', 'this roll')}**.\n"
+            f"Your roll: **{existing.get('roll')}**",
+            ephemeral=True,
+        )
+        return
+
+    display_name = (
+        getattr(interaction.user, "display_name", None)
+        or getattr(interaction.user, "name", "Unknown")
+    )
+
+    roll_value = random.randint(0, 100)
+
+    rolls[user_id] = {
+        "user_id": interaction.user.id,
+        "display_name": display_name,
+        "roll": roll_value,
+        "timestamp": dt_to_str(utcnow()),
+    }
+
+    save_state()
+
+    await interaction.response.send_message(
+        f"🎲 **{display_name}** rolled **{roll_value}** for **{state.get('title', 'Roll')}**.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    try:
+        await interaction.message.edit(
+            content=build_roll_panel_content(state, roll_id),
+            view=RollView(),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def handle_roll_info_button(interaction: discord.Interaction):
+    if interaction.message is None:
+        await interaction.response.send_message(
+            "Roll panel not found.",
+            ephemeral=True,
+        )
+        return
+
+    roll_id = interaction.message.id
+    state = get_roll_state(roll_id)
+
+    if state is None:
+        await interaction.response.send_message(
+            "This roll window was not found.",
+            ephemeral=True,
+        )
+        return
+
+    closes_at = str_to_dt(state.get("closes_at"))
+
+    if not state.get("closed") and closes_at and utcnow() >= closes_at:
+        await close_roll_window(roll_id, announce=True)
+
+    await interaction.response.send_message(
+        build_roll_info_content(
+            state,
+            roll_id,
+            viewer_id=interaction.user.id,
+        ),
+        ephemeral=True,
+    )
+
+
+class RollView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Roll",
+        emoji="🎲",
+        style=discord.ButtonStyle.primary,
+        custom_id="bidbot_roll_button",
+    )
+    async def roll_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_roll_button(interaction)
+
+    @discord.ui.button(
+        label="Roll Info",
+        emoji="📊",
+        style=discord.ButtonStyle.secondary,
+        custom_id="bidbot_roll_info_button",
+    )
+    async def roll_info_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_roll_info_button(interaction)
+        
 # ──────────────────────────────────────────────────────────────────────────────
 # Bot lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
@@ -320,13 +732,27 @@ def recalc_phase1_bidders(state: dict) -> None:
 
 @bot.event
 async def on_ready():
+    global roll_views_registered
+
     load_state()
+
+    if not roll_views_registered:
+        bot.add_view(RollView())
+        roll_views_registered = True
+
     await bot.tree.sync()
+
     if not phase_checker.is_running():
         phase_checker.start()
+
+    if not roll_checker.is_running():
+        roll_checker.start()
+
     print(f"Logged in as {bot.user}")
     print("Phase checker running:", phase_checker.is_running())
+    print("Roll checker running:", roll_checker.is_running())
     print("Loaded bid states:", len(bid_state))
+    print("Loaded roll states:", len(roll_state))
     
 
 
@@ -519,9 +945,142 @@ async def before_phase_checker():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Background roll watcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@tasks.loop(minutes=1)
+async def roll_checker():
+    now = utcnow()
+
+    for roll_id, state in list(roll_state.items()):
+        if state.get("closed"):
+            continue
+
+        closes_at = str_to_dt(state.get("closes_at"))
+
+        if closes_at and now >= closes_at:
+            await close_roll_window(roll_id, announce=True)
+
+
+@roll_checker.before_loop
+async def before_roll_checker():
+    await bot.wait_until_ready()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Commands
 # ──────────────────────────────────────────────────────────────────────────────
 
+@bot.tree.command(name="roll", description="Open a roll panel")
+@app_commands.describe(
+    title="What this roll is for",
+    duration_hours="How long the roll stays open. Default is 24 hours.",
+)
+async def roll(
+    interaction: discord.Interaction,
+    title: str,
+    duration_hours: int = 24,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can open roll panels.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    title = title.strip()
+
+    if not title:
+        await interaction.response.send_message(
+            "Roll title cannot be blank.",
+            ephemeral=True,
+        )
+        return
+
+    if duration_hours <= 0:
+        await interaction.response.send_message(
+            "Duration must be at least 1 hour.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🎲 **Roll Open — {title}**\nSetting up roll panel...",
+        view=RollView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    sent = await interaction.original_response()
+
+    now = utcnow()
+
+    roll_state[sent.id] = {
+        "title": title,
+        "channel_id": channel.id,
+        "message_id": sent.id,
+        "created_by": interaction.user.id,
+        "created_at": dt_to_str(now),
+        "closes_at": dt_to_str(now + timedelta(hours=duration_hours)),
+        "closed": False,
+        "closed_at": None,
+        "rolls": {},
+    }
+
+    save_state()
+
+    await sent.edit(
+        content=build_roll_panel_content(roll_state[sent.id], sent.id),
+        view=RollView(),
+    )
+
+@bot.tree.command(name="closeroll", description="Close a roll panel early")
+@app_commands.describe(
+    roll_id="The Roll ID shown on the roll panel",
+)
+async def closeroll(interaction: discord.Interaction, roll_id: str):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can close roll panels.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        parsed_roll_id = int(roll_id.strip())
+    except ValueError:
+        await interaction.response.send_message(
+            "Roll ID must be the number shown on the roll panel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    success, message = await close_roll_window(
+        parsed_roll_id,
+        announce=True,
+    )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="ping")
 async def ping(interaction: discord.Interaction):
