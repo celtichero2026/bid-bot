@@ -49,6 +49,47 @@ def is_leader(
         return False
     return any(role.id in LEADER_ROLE_IDS for role in member.roles)
 
+def parse_bid_numbers(value: str) -> list[int]:
+    """
+    Accepts formats such as:
+    1
+    1,2,3
+    1 2 3
+    1-4
+    1,3-5,8
+    """
+    numbers: set[int] = set()
+
+    cleaned = value.replace(" ", ",")
+
+    for part in cleaned.split(","):
+        part = part.strip()
+
+        if not part:
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+
+            if start <= 0 or end <= 0 or end < start:
+                raise ValueError("Invalid bid-number range.")
+
+            numbers.update(range(start, end + 1))
+        else:
+            number = int(part)
+
+            if number <= 0:
+                raise ValueError("Bid numbers must be greater than zero.")
+
+            numbers.add(number)
+
+    if not numbers:
+        raise ValueError("No bid numbers were provided.")
+
+    return sorted(numbers)
+
 
 @bot.tree.error
 async def on_app_command_error(
@@ -972,204 +1013,386 @@ async def all_in(interaction: discord.Interaction, toon: str, amount: int):
 
         save_state()
 
-@bot.tree.command(name="correctbid", description="Correct the amount on a specific bid")
+@bot.tree.command(
+    name="correctbid",
+    description="Correct the amount, toon name, or both on a bid",
+)
 @app_commands.describe(
     bid_number="The bid number to correct",
-    amount="The corrected bid amount",
-    reason="Why this bid is being corrected",
+    reason="Why the bid is being corrected",
+    amount="Corrected amount, if needed",
+    toon="Corrected toon name, if needed",
 )
 async def correctbid(
-    interaction: discord.Interaction, bid_number: int, amount: int, reason: str
+    interaction: discord.Interaction,
+    bid_number: int,
+    reason: str,
+    amount: int | None = None,
+    toon: str | None = None,
 ):
     if not is_allowed_channel(interaction.channel):
         await interaction.response.send_message(
-            "Use this in bid channels only.", ephemeral=True
-        )
-        return
-
-    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message(
-            "Only leaders can correct bids.", ephemeral=True
-        )
-        return
-
-    channel = interaction.channel
-    if channel is None:
-        await interaction.response.send_message("Channel not found.", ephemeral=True)
-        return
-
-    state = get_state(channel.id)
-    if state is None:
-        await interaction.response.send_message(
-            "No open auction found in this thread.", ephemeral=True
-        )
-        return
-
-    if amount < 0:
-        await interaction.response.send_message(
-            "Corrected amount cannot be negative.", ephemeral=True
-        )
-        return
-
-    target = None
-
-    for entry in state.get("bid_log", []):
-        if entry.get("bid_number") == bid_number:
-            target = entry
-            break
-
-    if target is None:
-        await interaction.response.send_message(
-            f"No bid found with bid number **#{bid_number}**.", ephemeral=True
-        )
-        return
-
-    if not target.get("valid"):
-        await interaction.response.send_message(
-            f"Bid **#{bid_number}** is invalid. Invalidate corrections should stay separate.",
+            "Use this in bid channels only.",
             ephemeral=True,
         )
         return
 
-    old_amount = target["amount"]
-
-    # Check previous valid bid before this one
-    previous_valid = None
-    for entry in state.get("bid_log", []):
-        if entry.get("bid_number") == bid_number:
-            break
-        if entry.get("valid"):
-            previous_valid = entry
-
-    min_outbid = state["outbid_inc"]
-
-    if previous_valid:
-        required = previous_valid["amount"] + min_outbid
-        if amount < required:
-            await interaction.response.send_message(
-                f"❌ Corrected amount is too low.\n"
-                f"Previous valid bid was **{previous_valid['amount']:,}**.\n"
-                f"Corrected bid must be at least **{required:,}**.",
-                ephemeral=True,
-            )
-            return
-    else:
-        min_bid = state["min_bid"]
-        if amount < min_bid:
-            await interaction.response.send_message(
-                f"❌ Corrected amount is below the minimum bid of **{min_bid:,}**.",
-                ephemeral=True,
-            )
-            return
-
-    target["amount"] = amount
-    target["corrected"] = True
-    target["correction_reason"] = reason
-    target["old_amount"] = old_amount
-
-    target_message_id = target.get("message_id")
-    if target_message_id:
-        try:
-            msg = await channel.fetch_message(target_message_id)
-            await msg.add_reaction("✏️")
-        except discord.HTTPException:
-            pass
-
-    recalc_last_valid_bid(state)
-    recalc_phase1_bidders(state)
-    save_state()
-
-    new_last = state.get("last_valid_bid")
-
-    await interaction.response.send_message(
-        f"✏️ Bid **#{bid_number}** corrected.\n"
-        f"Old amount: **{old_amount:,}**\n"
-        f"New amount: **{amount:,}**\n"
-        f"Reason: {reason}\n"
-        f"Current valid bid: **{new_last['toon']} {new_last['amount']:,}**"
-    )
-
-
-@bot.tree.command(
-    name="invalidate", description="Invalidate a specific bid by bid number"
-)
-@app_commands.describe(
-    bid_number="The bid number to invalidate",
-    reason="Why this bid is being invalidated",
-)
-async def invalidate(interaction: discord.Interaction, bid_number: int, reason: str):
-    if not is_allowed_channel(interaction.channel):
+    if interaction.guild is None or not is_leader(
+        interaction.user,
+        interaction.guild,
+    ):
         await interaction.response.send_message(
-            "Use this in bid channels only.", ephemeral=True
-        )
-        return
-
-    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message(
-            "Only leaders can invalidate bids.", ephemeral=True
+            "Only leaders can correct bids.",
+            ephemeral=True,
         )
         return
 
     channel = interaction.channel
     if channel is None:
-        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
         return
 
     state = get_state(channel.id)
     if state is None:
         await interaction.response.send_message(
-            "No open auction found in this thread.", ephemeral=True
+            "No auction found in this thread.",
+            ephemeral=True,
         )
         return
 
-    target = None
-
-    for entry in state.get("bid_log", []):
-        if entry.get("bid_number") == bid_number:
-            target = entry
-            break
-
-    if target is None:
+    if amount is None and toon is None:
         await interaction.response.send_message(
-            f"No bid found with bid number **#{bid_number}**.", ephemeral=True
+            "Enter a corrected `amount`, `toon`, or both.",
+            ephemeral=True,
         )
         return
 
-    if not target.get("valid"):
+    if amount is not None and amount < 0:
         await interaction.response.send_message(
-            f"Bid **#{bid_number}** is already invalid.", ephemeral=True
+            "Corrected amount cannot be negative.",
+            ephemeral=True,
         )
         return
 
-    target["valid"] = False
-    target["reason"] = f"Invalidated by leader: {reason}"
+    if toon is not None:
+        toon = toon.strip()
 
-    target_message_id = target.get("message_id")
-    if target_message_id:
-        try:
-            msg = await channel.fetch_message(target_message_id)
-            await msg.add_reaction("❌")
-        except discord.HTTPException:
-            pass
+        if not toon:
+            await interaction.response.send_message(
+                "Corrected toon name cannot be blank.",
+                ephemeral=True,
+            )
+            return
 
-    recalc_last_valid_bid(state)
-    recalc_phase1_bidders(state)
-    save_state()
+    lock = get_bid_lock(channel.id)
 
-    new_last = state.get("last_valid_bid")
+    async with lock:
+        bid_log = state.get("bid_log", [])
+        target_index = None
 
-    if new_last:
+        for index, entry in enumerate(bid_log):
+            if entry.get("bid_number") == bid_number:
+                target_index = index
+                break
+
+        if target_index is None:
+            await interaction.response.send_message(
+                f"No bid found with bid number **#{bid_number}**.",
+                ephemeral=True,
+            )
+            return
+
+        target = bid_log[target_index]
+
+        if not target.get("valid"):
+            await interaction.response.send_message(
+                f"Bid **#{bid_number}** is invalid and cannot be corrected.",
+                ephemeral=True,
+            )
+            return
+
+        old_amount = target["amount"]
+        old_toon = target["toon"]
+
+        amount_changed = amount is not None and amount != old_amount
+        toon_changed = toon is not None and toon != old_toon
+
+        if not amount_changed and not toon_changed:
+            await interaction.response.send_message(
+                "The corrected values are the same as the current bid.",
+                ephemeral=True,
+            )
+            return
+
+        if amount_changed:
+            previous_valid = None
+            next_valid = None
+
+            for entry in reversed(bid_log[:target_index]):
+                if entry.get("valid"):
+                    previous_valid = entry
+                    break
+
+            for entry in bid_log[target_index + 1:]:
+                if entry.get("valid"):
+                    next_valid = entry
+                    break
+
+            min_outbid = state["outbid_inc"]
+
+            if previous_valid:
+                minimum_allowed = previous_valid["amount"] + min_outbid
+            else:
+                minimum_allowed = state["min_bid"]
+
+            if amount < minimum_allowed:
+                await interaction.response.send_message(
+                    f"Corrected amount must be at least "
+                    f"**{minimum_allowed:,}**.",
+                    ephemeral=True,
+                )
+                return
+
+            if next_valid:
+                maximum_allowed = next_valid["amount"] - min_outbid
+
+                if amount > maximum_allowed:
+                    await interaction.response.send_message(
+                        f"Corrected amount cannot exceed "
+                        f"**{maximum_allowed:,}**, because the next valid bid "
+                        f"is **#{next_valid.get('bid_number')} — "
+                        f"{next_valid['amount']:,}**.",
+                        ephemeral=True,
+                    )
+                    return
+
+        corrections = target.setdefault("corrections", [])
+
+        correction_record = {
+            "reason": reason,
+            "corrected_by": interaction.user.id,
+            "timestamp": dt_to_str(utcnow()),
+        }
+
+        changes: list[str] = []
+
+        if amount_changed:
+            correction_record["old_amount"] = old_amount
+            correction_record["new_amount"] = amount
+
+            target["old_amount"] = old_amount
+            target["amount"] = amount
+
+            changes.append(
+                f"Amount: **{old_amount:,} → {amount:,}**"
+            )
+
+        if toon_changed:
+            correction_record["old_toon"] = old_toon
+            correction_record["new_toon"] = toon
+
+            target["old_toon"] = old_toon
+            target["toon"] = toon
+
+            changes.append(
+                f"Toon: **{old_toon} → {toon}**"
+            )
+
+        corrections.append(correction_record)
+
+        target["corrected"] = True
+        target["correction_reason"] = reason
+
+        recalc_last_valid_bid(state)
+        recalc_phase1_bidders(state)
+        save_state()
+
+        target_message_id = target.get("message_id")
+
+        if target_message_id:
+            try:
+                message = await channel.fetch_message(target_message_id)
+                await message.add_reaction("✏️")
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+                pass
+
+        new_last = state.get("last_valid_bid")
+
+        response_lines = [
+            f"✏️ Bid **#{bid_number}** corrected.",
+            *changes,
+            f"Reason: {reason}",
+        ]
+
+        if new_last:
+            response_lines.append(
+                f"Current valid bid: "
+                f"**{new_last['toon']} — {new_last['amount']:,}**"
+            )
+
         await interaction.response.send_message(
-            f"❌ Bid **#{bid_number}** invalidated.\n"
-            f"Reason: {reason}\n"
-            f"Current valid bid: **{new_last['toon']} {new_last['amount']:,}**"
+            "\n".join(response_lines)
         )
-    else:
+
+
+@bot.tree.command(
+    name="invalidate",
+    description="Invalidate one or more bids by bid number",
+)
+@app_commands.describe(
+    bid_numbers="Bid numbers, such as 2,4,7 or 2-5",
+    reason="Why these bids are being invalidated",
+)
+async def invalidate(
+    interaction: discord.Interaction,
+    bid_numbers: str,
+    reason: str,
+):
+    if not is_allowed_channel(interaction.channel):
         await interaction.response.send_message(
-            f"❌ Bid **#{bid_number}** invalidated.\n"
-            f"Reason: {reason}\n"
-            "There are no remaining valid bids."
+            "Use this in bid channels only.",
+            ephemeral=True,
         )
+        return
+
+    if interaction.guild is None or not is_leader(
+        interaction.user,
+        interaction.guild,
+    ):
+        await interaction.response.send_message(
+            "Only leaders can invalidate bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        requested_numbers = parse_bid_numbers(bid_numbers)
+    except ValueError:
+        await interaction.response.send_message(
+            "Enter bid numbers like `2`, `2,4,7`, or `2-5`.",
+            ephemeral=True,
+        )
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        entries_by_number = {
+            entry.get("bid_number"): entry
+            for entry in state.get("bid_log", [])
+        }
+
+        invalidated: list[int] = []
+        already_invalid: list[int] = []
+        not_found: list[int] = []
+        message_ids: list[int] = []
+
+        for bid_number in requested_numbers:
+            target = entries_by_number.get(bid_number)
+
+            if target is None:
+                not_found.append(bid_number)
+                continue
+
+            if not target.get("valid"):
+                already_invalid.append(bid_number)
+                continue
+
+            target["valid"] = False
+            target["reason"] = f"Invalidated by leader: {reason}"
+            invalidated.append(bid_number)
+
+            if target.get("message_id"):
+                message_ids.append(target["message_id"])
+
+        if not invalidated:
+            details = []
+
+            if already_invalid:
+                details.append(
+                    "Already invalid: "
+                    + ", ".join(f"#{number}" for number in already_invalid)
+                )
+
+            if not_found:
+                details.append(
+                    "Not found: "
+                    + ", ".join(f"#{number}" for number in not_found)
+                )
+
+            await interaction.response.send_message(
+                "No bids were invalidated.\n" + "\n".join(details),
+                ephemeral=True,
+            )
+            return
+
+        recalc_last_valid_bid(state)
+        recalc_phase1_bidders(state)
+        save_state()
+
+        for message_id in message_ids:
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.add_reaction("❌")
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+                pass
+
+        lines = [
+            "❌ **Bids Invalidated**",
+            "Bids: " + ", ".join(f"**#{number}**" for number in invalidated),
+            f"Reason: {reason}",
+        ]
+
+        if already_invalid:
+            lines.append(
+                "Already invalid: "
+                + ", ".join(f"#{number}" for number in already_invalid)
+            )
+
+        if not_found:
+            lines.append(
+                "Not found: "
+                + ", ".join(f"#{number}" for number in not_found)
+            )
+
+        new_last = state.get("last_valid_bid")
+
+        if new_last:
+            lines.append(
+                f"Current valid bid: "
+                f"**{new_last['toon']} — {new_last['amount']:,}**"
+            )
+        else:
+            lines.append("There are no remaining valid bids.")
+
+        await interaction.response.send_message("\n".join(lines))
 
 
 @bot.tree.command(name="closebid", description="Force close the current bid thread")
