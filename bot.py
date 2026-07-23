@@ -145,6 +145,33 @@ def str_to_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
+def shift_state_datetime(state: dict, key: str, duration: timedelta) -> None:
+    value = str_to_dt(state.get(key))
+
+    if value:
+        state[key] = dt_to_str(value + duration)
+
+
+def shift_bid_timers_after_pause(state: dict, duration: timedelta) -> None:
+    """
+    Moves timer-related timestamps forward so paused time does not count.
+    This also shifts bid_log timestamps so later recalculations do not undo the pause.
+    """
+    shift_state_datetime(state, "phase1_start", duration)
+    shift_state_datetime(state, "last_bid_time", duration)
+
+    last_valid = state.get("last_valid_bid")
+    if last_valid:
+        value = str_to_dt(last_valid.get("timestamp"))
+        if value:
+            last_valid["timestamp"] = dt_to_str(value + duration)
+
+    for entry in state.get("bid_log", []):
+        value = str_to_dt(entry.get("timestamp"))
+        if value:
+            entry["timestamp"] = dt_to_str(value + duration)
+
+
 def ensure_data_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -286,6 +313,13 @@ def init_state(
         "min_bid": min_bid,
         "outbid_inc": outbid_inc,
         "closed": False,
+        "paused": False,
+        "paused_at": None,
+        "pause_reason": None,
+        "paused_by": None,
+        "resumed_at": None,
+        "resumed_by": None,
+        "total_paused_seconds": 0,
         "phase2_announced": False,
         "closed_announced": False,
         "last_valid_bid": {
@@ -858,6 +892,10 @@ async def phase_checker():
         if state.get("closed") or state.get("phase") == 3:
             continue
 
+        # Skip paused bids completely so phases and close timers do not progress
+        if state.get("paused"):
+            continue
+
         thread = bot.get_channel(thread_id)
 
         if thread is None:
@@ -1184,6 +1222,15 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
             await reply("🔒 Bidding is closed for this item.")
             return
 
+        if state.get("paused"):
+            reason = state.get("pause_reason") or "Leadership review"
+
+            await reply(
+                f"⏸️ Bidding is currently paused.\n"
+                f"Reason: {reason}"
+            )
+            return
+
         phase1_bidders = state.get("phase1_bidders", set())
         if (
             state["phase"] == 2
@@ -1394,6 +1441,8 @@ async def bidinfo(interaction: discord.Interaction):
     now = utcnow()
     phase1_start = str_to_dt(state["phase1_start"])
     last_bid_time = str_to_dt(state["last_bid_time"])
+    paused = state.get("paused", False)
+    pause_reason = state.get("pause_reason") or "N/A"
 
     phase2_eta = "N/A"
     close_eta = "N/A"
@@ -1410,6 +1459,18 @@ async def bidinfo(interaction: discord.Interaction):
         h, m = divmod(total // 60, 60)
         close_eta = f"{h}h {m}m"
 
+    if paused:
+        phase2_eta = "Paused"
+        close_eta = "Paused"
+
+    pause_line = "Paused: **No**\n"
+
+    if paused:
+        pause_line = (
+            "Paused: **Yes**\n"
+            f"Pause Reason: **{pause_reason}**\n"
+        )
+
     next_valid = state["current_bid"] + state["outbid_inc"]
     bidder_count = len(state.get("phase1_bidders", set()))
 
@@ -1421,6 +1482,7 @@ async def bidinfo(interaction: discord.Interaction):
         f"Min Outbid: **{state['outbid_inc']:,}**\n"
         f"Next Valid Bid: **{next_valid:,}**\n"
         f"Phase: **{phase_label(state['phase'])}**\n"
+        f"{pause_line}"
         f"Eligible Phase 2 Bidders: **{bidder_count}**\n"
         f"Phase 2 Starts In: **{phase2_eta}**\n"
         f"Close In: **{close_eta}**",
@@ -1504,6 +1566,15 @@ async def all_in(interaction: discord.Interaction, toon: str, amount: int):
     async with lock:
         if state["phase"] == 3 or state["closed"]:
             await reply("🔒 Bidding is closed for this item.")
+            return
+
+        if state.get("paused"):
+            reason = state.get("pause_reason") or "Leadership review"
+
+            await reply(
+                f"⏸️ Bidding is currently paused.\n"
+                f"Reason: {reason}"
+            )
             return
 
         phase1_bidders = state.get("phase1_bidders", set())
@@ -1953,6 +2024,167 @@ async def invalidate(
             lines.append("There are no remaining valid bids.")
 
         await interaction.response.send_message("\n".join(lines))
+
+
+
+@bot.tree.command(name="pausebid", description="Pause the current bid thread")
+@app_commands.describe(reason="Why this bid is being paused")
+async def pausebid(
+    interaction: discord.Interaction,
+    reason: str = "Leadership review",
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can pause bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state.get("closed") or state.get("phase") == 3:
+            await interaction.response.send_message(
+                "This bid is already closed.",
+                ephemeral=True,
+            )
+            return
+
+        if state.get("paused"):
+            await interaction.response.send_message(
+                "This bid is already paused.",
+                ephemeral=True,
+            )
+            return
+
+        reason = reason.strip() or "Leadership review"
+
+        state["paused"] = True
+        state["paused_at"] = dt_to_str(utcnow())
+        state["pause_reason"] = reason
+        state["paused_by"] = interaction.user.id
+
+        save_state()
+
+    await interaction.response.send_message(
+        f"⏸️ **Bidding Paused**\n"
+        f"Reason: {reason}\n\n"
+        "No new bids will be accepted, and phase timers will not progress until this bid is resumed.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="resumebid", description="Resume a paused bid thread")
+async def resumebid(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can resume bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state.get("closed") or state.get("phase") == 3:
+            await interaction.response.send_message(
+                "This bid is already closed.",
+                ephemeral=True,
+            )
+            return
+
+        if not state.get("paused"):
+            await interaction.response.send_message(
+                "This bid is not currently paused.",
+                ephemeral=True,
+            )
+            return
+
+        now = utcnow()
+        paused_at = str_to_dt(state.get("paused_at"))
+
+        paused_seconds = 0
+
+        if paused_at:
+            paused_seconds = max(
+                int((now - paused_at).total_seconds()),
+                0,
+            )
+
+            pause_duration = timedelta(seconds=paused_seconds)
+
+            # Move timers forward so paused time does not count
+            shift_bid_timers_after_pause(state, pause_duration)
+
+        state["paused"] = False
+        state["resumed_at"] = dt_to_str(now)
+        state["paused_at"] = None
+        state["resumed_by"] = interaction.user.id
+        state["total_paused_seconds"] = (
+            state.get("total_paused_seconds", 0) + paused_seconds
+        )
+
+        save_state()
+
+    minutes = paused_seconds // 60
+    hours, minutes = divmod(minutes, 60)
+
+    await interaction.response.send_message(
+        f"▶️ **Bidding Resumed**\n"
+        f"Paused time added back to timers: **{hours}h {minutes}m**\n\n"
+        "Bids are now open again.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name="closebid", description="Force close the current bid thread")
