@@ -14,7 +14,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 LEADER_ROLE_IDS = [
     1415053351116079219,  # main server
-    1495844307666731069,  # test server role
 ]
 
 ALLOWED_CHANNEL_IDS = [
