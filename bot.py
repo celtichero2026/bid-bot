@@ -41,6 +41,7 @@ bid_state: dict[int, dict] = {}
 bid_locks: dict[int, Lock] = {}
 
 roll_state: dict[int, dict] = {}
+award_log: list[dict] = []
 roll_views_registered = False
 
 
@@ -238,11 +239,19 @@ def deserialize_roll_state(raw: dict) -> dict[int, dict]:
     return restored
 
 
+def deserialize_award_log(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
 def serialize_state() -> dict:
     return {
-        "version": 2,
+        "version": 3,
         "bid_state": serialize_bid_state(),
         "roll_state": serialize_roll_state(),
+        "award_log": award_log,
     }
 
 
@@ -254,27 +263,31 @@ def save_state() -> None:
 
 
 def load_state() -> None:
-    global bid_state, roll_state
+    global bid_state, roll_state, award_log
 
     ensure_data_dir()
 
     if not os.path.exists(DATA_FILE):
         bid_state = {}
         roll_state = {}
+        award_log = []
         return
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    # New format
+    # Combined state format. Missing award_log is treated as an empty log,
+    # so existing version 2 state files continue working without conversion.
     if isinstance(raw, dict) and "bid_state" in raw:
         bid_state = deserialize_bid_state(raw.get("bid_state", {}))
         roll_state = deserialize_roll_state(raw.get("roll_state", {}))
+        award_log = deserialize_award_log(raw.get("award_log", []))
         return
 
-    # Old format fallback — protects your current live bid_state.json
+    # Old format fallback — protects your original live bid_state.json.
     bid_state = deserialize_bid_state(raw)
     roll_state = {}
+    award_log = []
 
 
 def get_state(thread_id: int) -> dict | None:
@@ -424,6 +437,115 @@ def get_sorted_rolls(state: dict) -> list[dict]:
     )
 
 
+def next_award_log_id() -> int:
+    return max(
+        (int(entry.get("log_id", 0)) for entry in award_log),
+        default=0,
+    ) + 1
+
+
+def get_award_for_roll(roll_id: int) -> dict | None:
+    for entry in award_log:
+        if int(entry.get("roll_id", 0)) == roll_id:
+            return entry
+    return None
+
+
+def get_filtered_roll_awards(
+    guild_id: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+) -> list[dict]:
+    normalized_item = (item_query or "").strip().casefold()
+    entries = []
+
+    for entry in award_log:
+        if int(entry.get("guild_id", 0)) != guild_id:
+            continue
+
+        if member_id is not None and int(entry.get("winner_user_id", 0)) != member_id:
+            continue
+
+        item_name = str(entry.get("item", ""))
+        if normalized_item and normalized_item not in item_name.casefold():
+            continue
+
+        entries.append(entry)
+
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry.get("awarded_at", ""),
+            int(entry.get("log_id", 0)),
+        ),
+        reverse=True,
+    )
+
+
+def format_award_timestamp(value: str | None) -> str:
+    awarded_at = str_to_dt(value)
+    if awarded_at is None:
+        return "Unknown date"
+    return f"<t:{int(awarded_at.timestamp())}:f>"
+
+
+def build_roll_awards_content(
+    entries: list[dict],
+    page: int,
+    per_page: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+) -> str:
+    total = len(entries)
+    total_pages = max((total + per_page - 1) // per_page, 1)
+    page = min(max(page, 0), total_pages - 1)
+
+    lines = ["🏆 **Roll Awards**"]
+
+    filters = []
+    if member_id is not None:
+        filters.append(f"Member: <@{member_id}>")
+    if item_query:
+        filters.append(f"Item contains: **{discord.utils.escape_markdown(item_query)}**")
+
+    if filters:
+        lines.append(" • ".join(filters))
+
+    lines.append(f"Recorded awards: **{total}** • Page **{page + 1}/{total_pages}**")
+
+    if not entries:
+        lines.extend(["", "No recorded awards matched those filters."])
+        return "\n".join(lines)
+
+    start = page * per_page
+    page_entries = entries[start:start + per_page]
+
+    for entry in page_entries:
+        item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+        stored_name = discord.utils.escape_markdown(
+            str(entry.get("winner_name_at_award", "Unknown"))
+        )
+        winner_id = int(entry.get("winner_user_id", 0))
+        roll_value = entry.get("winning_roll", "?")
+        roll_id = entry.get("roll_id", "?")
+        log_id = entry.get("log_id", "?")
+        awarded_at = format_award_timestamp(entry.get("awarded_at"))
+        method = entry.get("selection_method", "highest_roll")
+        method_label = "Manual selection" if method == "manual" else "Highest roller"
+
+        lines.extend(
+            [
+                "",
+                f"**#{log_id} — {item}**",
+                f"Winner: <@{winner_id}> • Saved as: **{stored_name}**",
+                f"Roll: **{roll_value}** • {method_label} • {awarded_at}",
+                f"Roll ID: `{roll_id}`",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
 def build_roll_panel_content(state: dict, roll_id: int) -> str:
     title = state.get("title", "Roll")
     closed = state.get("closed", False)
@@ -452,6 +574,16 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
             [
                 "",
                 f"Current highest: **{top.get('display_name', 'Unknown')} — {top.get('roll')}**",
+            ]
+        )
+
+    if state.get("award_recorded"):
+        winner_id = state.get("award_winner_user_id")
+        award_log_id = state.get("award_log_id", "?")
+        lines.extend(
+            [
+                "",
+                f"🏆 Award recorded to <@{winner_id}> as Award **#{award_log_id}**.",
             ]
         )
 
@@ -759,6 +891,88 @@ class RollView(discord.ui.View):
     ):
         await handle_roll_info_button(interaction)
         
+class RollAwardsView(discord.ui.View):
+    def __init__(
+        self,
+        requester_id: int,
+        entries: list[dict],
+        member_id: int | None = None,
+        item_query: str | None = None,
+        per_page: int = 10,
+    ):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.entries = entries
+        self.member_id = member_id
+        self.item_query = item_query
+        self.per_page = per_page
+        self.page = 0
+        self.update_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max((len(self.entries) + self.per_page - 1) // self.per_page, 1)
+
+    def update_buttons(self) -> None:
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.total_pages - 1
+
+    def content(self) -> str:
+        return build_roll_awards_content(
+            self.entries,
+            self.page,
+            self.per_page,
+            member_id=self.member_id,
+            item_query=self.item_query,
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+
+        await interaction.response.send_message(
+            "Run `/rollawards` yourself to browse this history.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Previous",
+        emoji="◀️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def previous_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.page = max(self.page - 1, 0)
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=self.content(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Next",
+        emoji="▶️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def next_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.page = min(self.page + 1, self.total_pages - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=self.content(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Bot lifecycle
 # ──────────────────────────────────────────────────────────────────────────────
@@ -787,6 +1001,7 @@ async def on_ready():
     print("Roll checker running:", roll_checker.is_running())
     print("Loaded bid states:", len(bid_state))
     print("Loaded roll states:", len(roll_state))
+    print("Loaded roll awards:", len(award_log))
     
 
 
@@ -1070,6 +1285,7 @@ async def roll(
 
     roll_state[sent.id] = {
         "title": title,
+        "guild_id": interaction.guild.id,
         "channel_id": channel.id,
         "message_id": sent.id,
         "created_by": interaction.user.id,
@@ -1077,6 +1293,7 @@ async def roll(
         "closes_at": dt_to_str(now + timedelta(hours=duration_hours)),
         "closed": False,
         "closed_at": None,
+        "award_recorded": False,
         "rolls": {},
     }
 
@@ -1119,6 +1336,269 @@ async def closeroll(interaction: discord.Interaction, roll_id: str):
         message,
         ephemeral=True,
     )
+
+@bot.tree.command(
+    name="recordaward",
+    description="Record the winner of a completed roll",
+)
+@app_commands.describe(
+    roll_id="The Roll ID shown on the roll panel",
+    winner="Optional manual winner. Leave blank to use the unique highest roller.",
+)
+async def recordaward(
+    interaction: discord.Interaction,
+    roll_id: str,
+    winner: discord.Member | None = None,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in an allowed bid or roll channel.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can record roll awards.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        parsed_roll_id = int(roll_id.strip())
+    except ValueError:
+        await interaction.response.send_message(
+            "Roll ID must be the number shown on the roll panel.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_roll_state(parsed_roll_id)
+    if state is None:
+        await interaction.response.send_message(
+            "That roll could not be found.",
+            ephemeral=True,
+        )
+        return
+
+    state_guild_id = state.get("guild_id")
+    if state_guild_id and int(state_guild_id) != interaction.guild.id:
+        await interaction.response.send_message(
+            "That roll belongs to a different server.",
+            ephemeral=True,
+        )
+        return
+
+    existing_award = get_award_for_roll(parsed_roll_id)
+    if existing_award is not None or state.get("award_recorded"):
+        award_number = (
+            existing_award.get("log_id")
+            if existing_award is not None
+            else state.get("award_log_id", "?")
+        )
+        await interaction.response.send_message(
+            f"That roll is already recorded as Award **#{award_number}**.",
+            ephemeral=True,
+        )
+        return
+
+    closes_at = str_to_dt(state.get("closes_at"))
+    needs_close = False
+
+    if not state.get("closed"):
+        if closes_at and utcnow() >= closes_at:
+            needs_close = True
+        else:
+            await interaction.response.send_message(
+                "That roll is still open. Close it before recording the award.",
+                ephemeral=True,
+            )
+            return
+
+    sorted_rolls = get_sorted_rolls(state)
+    if not sorted_rolls:
+        await interaction.response.send_message(
+            "That roll has no recorded participants.",
+            ephemeral=True,
+        )
+        return
+
+    rolls = state.get("rolls", {})
+    selection_method = "highest_roll"
+
+    if winner is None:
+        highest_value = sorted_rolls[0].get("roll")
+        highest_rollers = [
+            roll for roll in sorted_rolls if roll.get("roll") == highest_value
+        ]
+
+        if len(highest_rollers) > 1:
+            tied_names = ", ".join(
+                f"<@{int(roll.get('user_id', 0))}>"
+                for roll in highest_rollers
+            )
+            await interaction.response.send_message(
+                "This roll ended in a tie between "
+                f"{tied_names}. Use `/recordaward` again and choose the `winner` option.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        selected_roll = highest_rollers[0]
+        winner_user_id = int(selected_roll.get("user_id", 0))
+        winner_member = interaction.guild.get_member(winner_user_id)
+    else:
+        selected_roll = rolls.get(str(winner.id))
+        if selected_roll is None:
+            await interaction.response.send_message(
+                f"{winner.mention} did not roll in that roll and cannot be recorded as its winner.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        winner_user_id = winner.id
+        winner_member = winner
+        selection_method = "manual"
+
+    await interaction.response.defer()
+
+    if needs_close:
+        await close_roll_window(parsed_roll_id, announce=True)
+
+    if winner_member is None:
+        try:
+            winner_member = await interaction.guild.fetch_member(winner_user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            winner_member = None
+
+    winner_name_at_award = (
+        winner_member.display_name
+        if winner_member is not None
+        else selected_roll.get("display_name", "Unknown")
+    )
+
+    now = utcnow()
+    log_id = next_award_log_id()
+    award_entry = {
+        "log_id": log_id,
+        "roll_id": parsed_roll_id,
+        "item": state.get("title", "Unknown item"),
+        "winner_user_id": winner_user_id,
+        "winner_name_at_award": winner_name_at_award,
+        "winner_name_when_rolled": selected_roll.get("display_name", "Unknown"),
+        "winning_roll": selected_roll.get("roll"),
+        "selection_method": selection_method,
+        "awarded_at": dt_to_str(now),
+        "recorded_by_user_id": interaction.user.id,
+        "recorded_by_name": getattr(interaction.user, "display_name", interaction.user.name),
+        "guild_id": interaction.guild.id,
+        "channel_id": state.get("channel_id"),
+    }
+
+    award_log.append(award_entry)
+    state["award_recorded"] = True
+    state["award_log_id"] = log_id
+    state["award_winner_user_id"] = winner_user_id
+    state["award_recorded_at"] = dt_to_str(now)
+    state["award_recorded_by"] = interaction.user.id
+    save_state()
+
+    channel_id = state.get("channel_id")
+    roll_channel = bot.get_channel(channel_id)
+    if roll_channel is None and channel_id:
+        try:
+            roll_channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            roll_channel = None
+
+    if roll_channel is not None:
+        try:
+            roll_message = await roll_channel.fetch_message(parsed_roll_id)
+            await roll_message.edit(
+                content=build_roll_panel_content(state, parsed_roll_id),
+                view=None,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    item_name = discord.utils.escape_markdown(str(award_entry["item"]))
+    method_text = (
+        "manually selected"
+        if selection_method == "manual"
+        else "highest roller"
+    )
+
+    await interaction.followup.send(
+        f"🏆 **Award #{log_id} Recorded — {item_name}**\n"
+        f"Winner: <@{winner_user_id}>\n"
+        f"Roll: **{selected_roll.get('roll')}** ({method_text})\n"
+        f"Roll ID: `{parsed_roll_id}`",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(
+    name="rollawards",
+    description="Browse recorded roll awards",
+)
+@app_commands.describe(
+    member="Only show awards won by this Discord account",
+    item="Only show awards whose item name contains this text",
+)
+async def rollawards(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    item: str | None = None,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in an allowed bid or roll channel.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    item_query = (item or "").strip() or None
+    member_id = member.id if member is not None else None
+    entries = get_filtered_roll_awards(
+        guild_id=interaction.guild.id,
+        member_id=member_id,
+        item_query=item_query,
+    )
+
+    view = None
+    if len(entries) > 10:
+        view = RollAwardsView(
+            requester_id=interaction.user.id,
+            entries=entries,
+            member_id=member_id,
+            item_query=item_query,
+        )
+
+    content = build_roll_awards_content(
+        entries,
+        page=0,
+        per_page=10,
+        member_id=member_id,
+        item_query=item_query,
+    )
+
+    await interaction.response.send_message(
+        content,
+        view=view,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
 
 @bot.tree.command(name="ping")
 async def ping(interaction: discord.Interaction):
