@@ -35,7 +35,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="%", intents=intents)
 
 bid_state: dict[int, dict] = {}
 bid_locks: dict[int, Lock] = {}
@@ -449,6 +449,52 @@ def get_award_for_roll(roll_id: int) -> dict | None:
         if int(entry.get("roll_id", 0)) == roll_id:
             return entry
     return None
+
+
+def get_roll_for_channel(
+    channel_id: int,
+    guild_id: int | None = None,
+) -> tuple[int, dict] | None:
+    """Return the newest unrecorded roll created in a channel/thread.
+
+    If every matching roll has already been recorded, the newest matching roll
+    is returned so the normal duplicate-award message can be shown.
+    """
+    matching: list[tuple[int, dict]] = []
+
+    for roll_id, state in roll_state.items():
+        if int(state.get("channel_id", 0)) != channel_id:
+            continue
+
+        state_guild_id = state.get("guild_id")
+        if (
+            guild_id is not None
+            and state_guild_id is not None
+            and int(state_guild_id) != guild_id
+        ):
+            continue
+
+        matching.append((roll_id, state))
+
+    if not matching:
+        return None
+
+    unrecorded = [
+        (roll_id, state)
+        for roll_id, state in matching
+        if not state.get("award_recorded")
+        and get_award_for_roll(roll_id) is None
+    ]
+
+    candidates = unrecorded or matching
+
+    return max(
+        candidates,
+        key=lambda pair: (
+            pair[1].get("created_at", ""),
+            pair[0],
+        ),
+    )
 
 
 def get_filtered_roll_awards(
@@ -931,7 +977,7 @@ class RollAwardsView(discord.ui.View):
             return True
 
         await interaction.response.send_message(
-            "Run `/rollawards` yourself to browse this history.",
+            "Run `%rollawards` yourself to browse this history.",
             ephemeral=True,
         )
         return False
@@ -1057,6 +1103,8 @@ async def on_message(message: discord.Message):
         "%pay",
         "%undo",
         "%refund",
+        "%recordaward",
+        "%rollawards",
     )
 
     if any(content.startswith(prefix) for prefix in ALLOWED_THREAD_PREFIXES):
@@ -1337,56 +1385,81 @@ async def closeroll(interaction: discord.Interaction, roll_id: str):
         ephemeral=True,
     )
 
-@bot.tree.command(
-    name="recordaward",
-    description="Record the winner of a completed roll",
-)
-@app_commands.describe(
-    roll_id="The Roll ID shown on the roll panel",
-    winner="Optional manual winner. Leave blank to use the unique highest roller.",
-)
+@bot.command(name="recordaward")
 async def recordaward(
-    interaction: discord.Interaction,
-    roll_id: str,
-    winner: discord.Member | None = None,
+    ctx: commands.Context,
+    *,
+    arguments: str = "",
 ):
-    if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message(
-            "Use this in an allowed bid or roll channel.",
-            ephemeral=True,
+    """
+    Record a completed roll award from the current item thread.
+
+    Normal usage:
+      %recordaward
+      %recordaward @winner
+
+    Optional explicit Roll ID fallback:
+      %recordaward <roll_id>
+      %recordaward <roll_id> @winner
+    """
+    if not is_allowed_channel(ctx.channel):
+        await ctx.send("Use this in an allowed bid or roll channel.")
+        return
+
+    if ctx.guild is None or not is_leader(ctx.author, ctx.guild):
+        await ctx.send("Only leaders can record roll awards.")
+        return
+
+    explicit_roll_id: int | None = None
+    invalid_arguments: list[str] = []
+
+    for token in arguments.split():
+        # Discord member mentions are resolved from ctx.message.mentions below.
+        if token.startswith("<@") and token.endswith(">"):
+            continue
+
+        if token.isdigit() and explicit_roll_id is None:
+            explicit_roll_id = int(token)
+            continue
+
+        invalid_arguments.append(token)
+
+    if invalid_arguments:
+        await ctx.send(
+            "Usage: `%recordaward`, `%recordaward @Player`, or optionally "
+            "`%recordaward <roll_id> @Player`."
         )
         return
 
-    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message(
-            "Only leaders can record roll awards.",
-            ephemeral=True,
-        )
-        return
+    winner: discord.Member | None = None
+    if ctx.message.mentions:
+        mentioned_user = ctx.message.mentions[0]
+        if isinstance(mentioned_user, discord.Member):
+            winner = mentioned_user
+        else:
+            winner = ctx.guild.get_member(mentioned_user.id)
 
-    try:
-        parsed_roll_id = int(roll_id.strip())
-    except ValueError:
-        await interaction.response.send_message(
-            "Roll ID must be the number shown on the roll panel.",
-            ephemeral=True,
-        )
-        return
+    if explicit_roll_id is not None:
+        parsed_roll_id = explicit_roll_id
+        state = get_roll_state(parsed_roll_id)
+    else:
+        channel_roll = get_roll_for_channel(ctx.channel.id, ctx.guild.id)
+        if channel_roll is None:
+            await ctx.send(
+                "I could not find a roll connected to this thread. Run the "
+                "command inside the item thread containing the roll panel."
+            )
+            return
 
-    state = get_roll_state(parsed_roll_id)
+        parsed_roll_id, state = channel_roll
+
     if state is None:
-        await interaction.response.send_message(
-            "That roll could not be found.",
-            ephemeral=True,
-        )
+        await ctx.send("That roll could not be found.")
         return
 
     state_guild_id = state.get("guild_id")
-    if state_guild_id and int(state_guild_id) != interaction.guild.id:
-        await interaction.response.send_message(
-            "That roll belongs to a different server.",
-            ephemeral=True,
-        )
+    if state_guild_id and int(state_guild_id) != ctx.guild.id:
+        await ctx.send("That roll belongs to a different server.")
         return
 
     existing_award = get_award_for_roll(parsed_roll_id)
@@ -1396,9 +1469,8 @@ async def recordaward(
             if existing_award is not None
             else state.get("award_log_id", "?")
         )
-        await interaction.response.send_message(
-            f"That roll is already recorded as Award **#{award_number}**.",
-            ephemeral=True,
+        await ctx.send(
+            f"That roll is already recorded as Award **#{award_number}**."
         )
         return
 
@@ -1409,18 +1481,14 @@ async def recordaward(
         if closes_at and utcnow() >= closes_at:
             needs_close = True
         else:
-            await interaction.response.send_message(
-                "That roll is still open. Close it before recording the award.",
-                ephemeral=True,
+            await ctx.send(
+                "That roll is still open. Close it before recording the award."
             )
             return
 
     sorted_rolls = get_sorted_rolls(state)
     if not sorted_rolls:
-        await interaction.response.send_message(
-            "That roll has no recorded participants.",
-            ephemeral=True,
-        )
+        await ctx.send("That roll has no recorded participants.")
         return
 
     rolls = state.get("rolls", {})
@@ -1437,23 +1505,23 @@ async def recordaward(
                 f"<@{int(roll.get('user_id', 0))}>"
                 for roll in highest_rollers
             )
-            await interaction.response.send_message(
+            await ctx.send(
                 "This roll ended in a tie between "
-                f"{tied_names}. Use `/recordaward` again and choose the `winner` option.",
-                ephemeral=True,
+                f"{tied_names}. Run `%recordaward @winner` in this thread "
+                "and mention the person receiving the item.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
         selected_roll = highest_rollers[0]
         winner_user_id = int(selected_roll.get("user_id", 0))
-        winner_member = interaction.guild.get_member(winner_user_id)
+        winner_member = ctx.guild.get_member(winner_user_id)
     else:
         selected_roll = rolls.get(str(winner.id))
         if selected_roll is None:
-            await interaction.response.send_message(
-                f"{winner.mention} did not roll in that roll and cannot be recorded as its winner.",
-                ephemeral=True,
+            await ctx.send(
+                f"{winner.mention} did not roll in that roll and cannot be "
+                "recorded as its winner.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
@@ -1462,14 +1530,12 @@ async def recordaward(
         winner_member = winner
         selection_method = "manual"
 
-    await interaction.response.defer()
-
     if needs_close:
         await close_roll_window(parsed_roll_id, announce=True)
 
     if winner_member is None:
         try:
-            winner_member = await interaction.guild.fetch_member(winner_user_id)
+            winner_member = await ctx.guild.fetch_member(winner_user_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             winner_member = None
 
@@ -1491,9 +1557,9 @@ async def recordaward(
         "winning_roll": selected_roll.get("roll"),
         "selection_method": selection_method,
         "awarded_at": dt_to_str(now),
-        "recorded_by_user_id": interaction.user.id,
-        "recorded_by_name": getattr(interaction.user, "display_name", interaction.user.name),
-        "guild_id": interaction.guild.id,
+        "recorded_by_user_id": ctx.author.id,
+        "recorded_by_name": getattr(ctx.author, "display_name", ctx.author.name),
+        "guild_id": ctx.guild.id,
         "channel_id": state.get("channel_id"),
     }
 
@@ -1502,7 +1568,7 @@ async def recordaward(
     state["award_log_id"] = log_id
     state["award_winner_user_id"] = winner_user_id
     state["award_recorded_at"] = dt_to_str(now)
-    state["award_recorded_by"] = interaction.user.id
+    state["award_recorded_by"] = ctx.author.id
     save_state()
 
     channel_id = state.get("channel_id")
@@ -1531,7 +1597,7 @@ async def recordaward(
         else "highest roller"
     )
 
-    await interaction.followup.send(
+    await ctx.send(
         f"🏆 **Award #{log_id} Recorded — {item_name}**\n"
         f"Winner: <@{winner_user_id}>\n"
         f"Roll: **{selected_roll.get('roll')}** ({method_text})\n"
@@ -1540,37 +1606,43 @@ async def recordaward(
     )
 
 
-@bot.tree.command(
-    name="rollawards",
-    description="Browse recorded roll awards",
-)
-@app_commands.describe(
-    member="Only show awards won by this Discord account",
-    item="Only show awards whose item name contains this text",
-)
-async def rollawards(
-    interaction: discord.Interaction,
-    member: discord.Member | None = None,
-    item: str | None = None,
-):
-    if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message(
-            "Use this in an allowed bid or roll channel.",
-            ephemeral=True,
-        )
+@bot.command(name="rollawards")
+async def rollawards(ctx: commands.Context, *, filters: str = ""):
+    """
+    Browse recorded roll awards.
+
+    Usage:
+      %rollawards
+      %rollawards @member
+      %rollawards item name
+      %rollawards @member item name
+    """
+    if not is_allowed_channel(ctx.channel):
+        await ctx.send("Use this in an allowed bid or roll channel.")
         return
 
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True,
-        )
+    if ctx.guild is None:
+        await ctx.send("This command can only be used in a server.")
         return
 
-    item_query = (item or "").strip() or None
+    member = ctx.message.mentions[0] if ctx.message.mentions else None
+    item_query = filters.strip()
+
+    if member is not None:
+        # Remove the member mention from the raw filter text. The remaining
+        # text, if any, becomes the item-name filter.
+        for mention_text in (
+            member.mention,
+            f"<@{member.id}>",
+            f"<@!{member.id}>",
+        ):
+            item_query = item_query.replace(mention_text, "")
+
+    item_query = " ".join(item_query.split()) or None
     member_id = member.id if member is not None else None
+
     entries = get_filtered_roll_awards(
-        guild_id=interaction.guild.id,
+        guild_id=ctx.guild.id,
         member_id=member_id,
         item_query=item_query,
     )
@@ -1578,7 +1650,7 @@ async def rollawards(
     view = None
     if len(entries) > 10:
         view = RollAwardsView(
-            requester_id=interaction.user.id,
+            requester_id=ctx.author.id,
             entries=entries,
             member_id=member_id,
             item_query=item_query,
@@ -1592,10 +1664,9 @@ async def rollawards(
         item_query=item_query,
     )
 
-    await interaction.response.send_message(
+    await ctx.send(
         content,
         view=view,
-        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
