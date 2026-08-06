@@ -25,7 +25,6 @@ ALLOWED_CHANNEL_IDS = [
     1447765439366168687,  # No Class Required
     1527381268264653001,  # Roll Channel
     1491844512828489918,  # TEST SERVER
-    1447670672611479702,  # Admin channel
 ]
 
 OUTBID_INCREMENT = 0.10
@@ -1618,10 +1617,6 @@ async def rollawards(ctx: commands.Context, *, filters: str = ""):
       %rollawards item name
       %rollawards @member item name
     """
-    if not is_allowed_channel(ctx.channel):
-        await ctx.send("Use this in an allowed bid or roll channel.")
-        return
-
     if ctx.guild is None:
         await ctx.send("This command can only be used in a server.")
         return
