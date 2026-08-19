@@ -2777,6 +2777,56 @@ async def closebid(interaction: discord.Interaction):
         )
 
 @bot.tree.command(
+    name="debugcommands",
+    description="Show Discord's registered slash command permission settings",
+)
+async def debugcommands(interaction: discord.Interaction):
+    if interaction.guild is None or not is_leader(
+        interaction.user,
+        interaction.guild,
+    ):
+        await interaction.response.send_message(
+            "Only leaders can use this command.",
+            ephemeral=True,
+        )
+        return
+
+    lines = ["🔧 **Registered Command Debug**", ""]
+
+    commands_list = bot.tree.get_commands()
+
+    for command in commands_list:
+        default_permissions = getattr(
+            command,
+            "default_permissions",
+            None,
+        )
+
+        guild_only = getattr(
+            command,
+            "guild_only",
+            None,
+        )
+
+        lines.extend([
+            f"**/{command.name}**",
+            f"`default_permissions`: `{default_permissions}`",
+            f"`guild_only`: `{guild_only}`",
+            "",
+        ])
+
+    content = "\n".join(lines)
+
+    # Discord message limit protection
+    if len(content) > 1900:
+        content = content[:1900] + "\n...truncated"
+
+    await interaction.response.send_message(
+        content,
+        ephemeral=True,
+    )
+
+@bot.tree.command(
     name="debugperms",
     description="Debug a member's bot/channel permissions",
 )
