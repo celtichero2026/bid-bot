@@ -2776,5 +2776,104 @@ async def closebid(interaction: discord.Interaction):
             "🔒 Bid closed manually. No valid bids recorded."
         )
 
+@bot.tree.command(
+    name="debugperms",
+    description="Debug a member's bot/channel permissions",
+)
+@app_commands.describe(
+    member="Member to inspect",
+)
+async def debugperms(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    # Only let leaders use the diagnostic
+    if interaction.guild is None or not is_leader(
+        interaction.user,
+        interaction.guild,
+    ):
+        await interaction.response.send_message(
+            "Only leaders can use this command.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    # Permissions Discord calculates for this member in this channel
+    perms = channel.permissions_for(member)
+
+    # Permissions Discord calculates for the bot itself
+    bot_member = interaction.guild.me
+    bot_perms = (
+        channel.permissions_for(bot_member)
+        if bot_member is not None
+        else None
+    )
+
+    member_role_ids = [role.id for role in member.roles]
+    matching_leader_roles = [
+        role_id
+        for role_id in member_role_ids
+        if role_id in LEADER_ROLE_IDS
+    ]
+
+    parent_id = (
+        channel.parent_id
+        if isinstance(channel, discord.Thread)
+        else None
+    )
+
+    lines = [
+        "🔧 **Permission Debug**",
+        "",
+        f"**Member:** {member} (`{member.id}`)",
+        f"**Channel:** {channel.mention} (`{channel.id}`)",
+        f"**Channel type:** `{type(channel).__name__}`",
+        f"**Parent ID:** `{parent_id}`",
+        "",
+        "**Your Bot Checks**",
+        f"`is_allowed_channel`: **{is_allowed_channel(channel)}**",
+        f"`is_leader`: **{is_leader(member, interaction.guild)}**",
+        f"`LEADER_ROLE_IDS`: `{LEADER_ROLE_IDS}`",
+        f"`Matching leader roles`: `{matching_leader_roles}`",
+        "",
+        "**Member Discord Permissions**",
+        f"`administrator`: **{perms.administrator}**",
+        f"`view_channel`: **{perms.view_channel}**",
+        f"`send_messages`: **{perms.send_messages}**",
+        f"`send_messages_in_threads`: **{perms.send_messages_in_threads}**",
+        f"`use_application_commands`: **{perms.use_application_commands}**",
+        f"`read_message_history`: **{perms.read_message_history}**",
+        "",
+        "**Member Role IDs**",
+        "```",
+        *[str(role_id) for role_id in member_role_ids],
+        "```",
+    ]
+
+    if bot_perms is not None:
+        lines.extend(
+            [
+                "**Bot Permissions In This Channel**",
+                f"`administrator`: **{bot_perms.administrator}**",
+                f"`view_channel`: **{bot_perms.view_channel}**",
+                f"`send_messages`: **{bot_perms.send_messages}**",
+                f"`send_messages_in_threads`: **{bot_perms.send_messages_in_threads}**",
+                f"`read_message_history`: **{bot_perms.read_message_history}**",
+            ]
+        )
+
+    await interaction.response.send_message(
+        "\n".join(lines),
+        ephemeral=True,
+    )
 
 bot.run(TOKEN)
