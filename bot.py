@@ -496,20 +496,18 @@ def build_fashion_embed() -> discord.Embed:
     embed = discord.Embed(
         title="✨ Dhio Fashion Weapon Tracker",
         description=(
-            "Current fashion weapon drops, bank inventory, and holders.\n"
+            "Current fashion weapon drops and bank inventory.\n"
             "Leaders can use the weapon buttons below to update the board."
         ),
     )
 
     for weapon in DEFAULT_FASHION_STATE:
         data = fashion_state.get(weapon, DEFAULT_FASHION_STATE[weapon])
-        holders = str(data.get("holders", "")).strip() or "None"
         embed.add_field(
             name=f"{FASHION_EMOJIS.get(weapon, '•')} {weapon}",
             value=(
                 f"**Dropped:** {int(data.get('dropped', 0))}  •  "
-                f"**Bank:** {int(data.get('bank', 0))}\n"
-                f"**Holders:** {holders}"
+                f"**Bank:** {int(data.get('bank', 0))}"
             ),
             inline=False,
         )
