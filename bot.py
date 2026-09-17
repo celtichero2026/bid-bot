@@ -1781,10 +1781,6 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Allow slash command messages
-    if content.startswith("/"):
-        await bot.process_commands(message)
-        return
 
     # Global bid-chat switch. When censorship is disabled, normal conversation
     # is allowed in bid threads and the bot does not react or warn.
