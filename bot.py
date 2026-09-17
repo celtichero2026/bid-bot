@@ -31,6 +31,23 @@ ALLOWED_CHANNEL_IDS = [
 OUTBID_INCREMENT = 0.10
 DATA_DIR = os.getenv("BIDBOT_DATA_DIR", "./data")
 DATA_FILE = os.path.join(DATA_DIR, "bid_state.json")
+FASHION_FILE = os.path.join(DATA_DIR, "fashion_state.json")
+
+# Dhio fashion tracker. This is stored separately from bid_state.json so the
+# fashion board cannot interfere with existing bids, rolls, or award history.
+DEFAULT_FASHION_STATE = {
+    "Axe": {"dropped": 5, "bank": 0, "holders": "Flash, March, Monju, Kay | 1 unaccounted"},
+    "Sword": {"dropped": 5, "bank": 2, "holders": "Deepfive, Dragada, Taki"},
+    "Wand": {"dropped": 2, "bank": 1, "holders": "Aud"},
+    "Grimoire": {"dropped": 4, "bank": 1, "holders": "DJ, Kael, Jaba"},
+    "Knuckles": {"dropped": 7, "bank": 5, "holders": "Lord X, Dodre"},
+    "Bow": {"dropped": 4, "bank": 0, "holders": "Tokyo, Lockheed, Alyrie, dragonxox"},
+    "Hammer": {"dropped": 3, "bank": 0, "holders": "Rahual, Dragada, Trophy"},
+    "Dagger": {"dropped": 5, "bank": 0, "holders": "Moh x2, Cora, Furi, Roy Nexx"},
+    "Totem": {"dropped": 1, "bank": 0, "holders": "Guava"},
+}
+fashion_state: dict[str, dict] = {}
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -423,6 +440,186 @@ def recalc_phase1_bidders(state: dict) -> None:
             valid_bidders.add(entry["bidder_id"])
 
     state["phase1_bidders"] = valid_bidders
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dhio fashion tracker
+# ──────────────────────────────────────────────────────────────────────────────
+
+FASHION_EMOJIS = {
+    "Axe": "🪓",
+    "Sword": "⚔️",
+    "Wand": "🪄",
+    "Grimoire": "📖",
+    "Knuckles": "🥊",
+    "Bow": "🏹",
+    "Hammer": "🔨",
+    "Dagger": "🗡️",
+    "Totem": "🪶",
+}
+
+
+def load_fashion_state() -> None:
+    global fashion_state
+    ensure_data_dir()
+
+    if not os.path.exists(FASHION_FILE):
+        fashion_state = json.loads(json.dumps(DEFAULT_FASHION_STATE))
+        save_fashion_state()
+        return
+
+    try:
+        with open(FASHION_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+
+    fashion_state = {}
+    for weapon, default in DEFAULT_FASHION_STATE.items():
+        saved = raw.get(weapon, {}) if isinstance(raw, dict) else {}
+        fashion_state[weapon] = {
+            "dropped": int(saved.get("dropped", default["dropped"])),
+            "bank": int(saved.get("bank", default["bank"])),
+            "holders": str(saved.get("holders", default["holders"])),
+        }
+
+
+def save_fashion_state() -> None:
+    ensure_data_dir()
+    with open(FASHION_FILE, "w", encoding="utf-8") as f:
+        json.dump(fashion_state, f, indent=2)
+
+
+def build_fashion_embed() -> discord.Embed:
+    total_dropped = sum(int(v.get("dropped", 0)) for v in fashion_state.values())
+    total_bank = sum(int(v.get("bank", 0)) for v in fashion_state.values())
+
+    embed = discord.Embed(
+        title="✨ Dhio Fashion Weapon Tracker",
+        description=(
+            "Current fashion weapon drops, bank inventory, and holders.\n"
+            "Leaders can use the weapon buttons below to update the board."
+        ),
+    )
+
+    for weapon in DEFAULT_FASHION_STATE:
+        data = fashion_state.get(weapon, DEFAULT_FASHION_STATE[weapon])
+        holders = str(data.get("holders", "")).strip() or "None"
+        embed.add_field(
+            name=f"{FASHION_EMOJIS.get(weapon, '•')} {weapon}",
+            value=(
+                f"**Dropped:** {int(data.get('dropped', 0))}  •  "
+                f"**Bank:** {int(data.get('bank', 0))}\n"
+                f"**Holders:** {holders}"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"Total dropped: {total_dropped} • In bank: {total_bank} • Use buttons to edit"
+    )
+    return embed
+
+
+class FashionEditModal(discord.ui.Modal):
+    def __init__(self, weapon: str):
+        super().__init__(title=f"Edit {weapon}")
+        self.weapon = weapon
+        data = fashion_state.get(weapon, DEFAULT_FASHION_STATE[weapon])
+
+        self.dropped = discord.ui.TextInput(
+            label="Total dropped",
+            default=str(data.get("dropped", 0)),
+            required=True,
+            max_length=4,
+        )
+        self.bank = discord.ui.TextInput(
+            label="Currently in bank",
+            default=str(data.get("bank", 0)),
+            required=True,
+            max_length=4,
+        )
+        self.holders = discord.ui.TextInput(
+            label="Current holders",
+            default=str(data.get("holders", "")),
+            placeholder="Example: Aud, Dragada, Trophy",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+        )
+        self.add_item(self.dropped)
+        self.add_item(self.bank)
+        self.add_item(self.holders)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can edit the fashion tracker.", ephemeral=True
+            )
+            return
+
+        try:
+            dropped = int(str(self.dropped.value).strip())
+            bank = int(str(self.bank.value).strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Dropped and Bank must both be whole numbers.", ephemeral=True
+            )
+            return
+
+        if dropped < 0 or bank < 0:
+            await interaction.response.send_message(
+                "Dropped and Bank cannot be negative.", ephemeral=True
+            )
+            return
+
+        if bank > dropped:
+            await interaction.response.send_message(
+                "Bank cannot be greater than the total number dropped.", ephemeral=True
+            )
+            return
+
+        fashion_state[self.weapon] = {
+            "dropped": dropped,
+            "bank": bank,
+            "holders": str(self.holders.value).strip(),
+        }
+        save_fashion_state()
+
+        await interaction.response.edit_message(
+            embed=build_fashion_embed(),
+            view=FashionTrackerView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class FashionWeaponButton(discord.ui.Button):
+    def __init__(self, weapon: str, row: int):
+        super().__init__(
+            label=weapon,
+            emoji=FASHION_EMOJIS.get(weapon),
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"bidbot_fashion_{weapon.lower()}",
+            row=row,
+        )
+        self.weapon = weapon
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can edit the fashion tracker.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(FashionEditModal(self.weapon))
+
+
+class FashionTrackerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        weapons = list(DEFAULT_FASHION_STATE.keys())
+        for index, weapon in enumerate(weapons):
+            # Five buttons max per Discord action row.
+            self.add_item(FashionWeaponButton(weapon, row=0 if index < 5 else 1))
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Roll helpers
@@ -1685,9 +1882,11 @@ async def on_ready():
     global roll_views_registered
 
     load_state()
+    load_fashion_state()
 
     if not roll_views_registered:
         bot.add_view(RollView())
+        bot.add_view(FashionTrackerView())
         roll_views_registered = True
 
     await bot.tree.sync()
@@ -3718,6 +3917,27 @@ async def closebid(interaction: discord.Interaction):
         await interaction.response.send_message(
             "🔒 Bid closed manually. No valid bids recorded."
         )
+
+
+@bot.tree.command(
+    name="fashionboard",
+    description="Post the editable Dhio fashion weapon tracker",
+)
+async def fashionboard(interaction: discord.Interaction):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can post the fashion tracker.", ephemeral=True
+        )
+        return
+
+    if not fashion_state:
+        load_fashion_state()
+
+    await interaction.response.send_message(
+        embed=build_fashion_embed(),
+        view=FashionTrackerView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 bot.run(TOKEN)
