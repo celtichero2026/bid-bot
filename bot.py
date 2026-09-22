@@ -970,10 +970,13 @@ class OneAwardReminderView(discord.ui.View):
             "phase": 1,
         }
         save_state()
+
+        # Keep the eligibility reminder private, but make every accepted roll public.
         await interaction.response.edit_message(
-            content=f"🎲 **{display_name}** rolled **{value}** for **{state.get('title', 'Roll')}**.",
+            content=f"✅ Roll accepted! You rolled **{value}** for **{state.get('title', 'Roll')}**.",
             view=None,
         )
+
         channel_id = state.get("channel_id")
         channel = bot.get_channel(channel_id) if channel_id else None
         if channel is None and channel_id:
@@ -982,6 +985,14 @@ class OneAwardReminderView(discord.ui.View):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 channel = None
         if channel is not None:
+            try:
+                await channel.send(
+                    f"🎲 **{display_name}** rolled **{value}** for **{state.get('title', 'Roll')}**.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
             try:
                 msg = await channel.fetch_message(self.roll_id)
                 await msg.edit(content=build_roll_panel_content(state, self.roll_id), view=RollView())
