@@ -991,7 +991,7 @@ class OneAwardReminderView(discord.ui.View):
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
     async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
-            content="Roll declined. Your current award stays with you.",
+            content="Roll declined. Keep your current award. You can jump back in during Phase 2 if it opens.",
             view=None,
         )
 
