@@ -945,6 +945,21 @@ class OneAwardReminderView(discord.ui.View):
             )
             return
 
+        # Re-check the hard one-per-weapon rule when Yes is clicked in case
+        # ownership changed while the reminder was open.
+        guild_id = int(state.get("guild_id", 0) or 0)
+        boss = str(state.get("boss", ""))
+        weapon_type = str(state.get("weapon_type", ""))
+        if player_has_boss_weapon_type(guild_id, interaction.user.id, boss, weapon_type):
+            await interaction.response.edit_message(
+                content=(
+                    f"❌ You already have a **{canonical_boss_type(boss) or boss} {weapon_type}** award. "
+                    "Players may only hold one of each weapon type from the same boss."
+                ),
+                view=None,
+            )
+            return
+
         display_name = getattr(interaction.user, "display_name", getattr(interaction.user, "name", "Unknown"))
         value = random.randint(0, 100)
         state["rolls"][str(interaction.user.id)] = {
@@ -1531,6 +1546,7 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
         if phase == 1:
             lines.extend([
                 "• Phase 1 runs from hour 0–12",
+                "• You may only hold one of each weapon type from this boss",
                 "• 0 current weapon awards → roll accepted",
                 "• 1 current weapon award → reminder asks if you would return it for this item",
                 "• 2+ current weapon awards → wait for Phase 2",
@@ -1816,6 +1832,16 @@ async def handle_roll_button(interaction: discord.Interaction):
     boss = str(state.get("boss", ""))
     weapon_type = str(state.get("weapon_type", ""))
 
+    # Hard rule for official weapon rolls: one of each weapon type per boss.
+    # This applies in BOTH phases and takes precedence over award-count priority.
+    if player_has_boss_weapon_type(guild_id, interaction.user.id, boss, weapon_type):
+        await interaction.response.send_message(
+            f"❌ You already have a **{canonical_boss_type(boss) or boss} {weapon_type}** award. "
+            "Players may only hold one of each weapon type from the same boss.",
+            ephemeral=True,
+        )
+        return
+
     if phase == 1:
         # Phase 1 award count is per boss set. Awards from a future different
         # boss do not reduce a player's priority on this boss's items.
@@ -1841,15 +1867,8 @@ async def handle_roll_button(interaction: discord.Interaction):
         )
         return
 
-    # Phase 2 ignores total award count and checks boss + weapon type together.
-    if player_has_boss_weapon_type(guild_id, interaction.user.id, boss, weapon_type):
-        await interaction.response.send_message(
-            f"❌ You already have a **{canonical_boss_type(boss) or boss} {weapon_type}** award, "
-            "so this Phase 2 roll is declined.",
-            ephemeral=True,
-        )
-        return
-
+    # Phase 2 ignores total award count. The one-per-weapon hard rule was
+    # already checked above, so any remaining player may roll here.
     await accept_roll(interaction, state, roll_id)
 
 
