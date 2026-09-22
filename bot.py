@@ -33,20 +33,22 @@ DATA_DIR = os.getenv("BIDBOT_DATA_DIR", "./data")
 DATA_FILE = os.path.join(DATA_DIR, "bid_state.json")
 FASHION_FILE = os.path.join(DATA_DIR, "fashion_state.json")
 
-# Dhio fashion tracker. This is stored separately from bid_state.json so the
+# Dhiothu fashion tracker. This is stored separately from bid_state.json so the
 # fashion board cannot interfere with existing bids, rolls, or award history.
 DEFAULT_FASHION_STATE = {
-    "Axe": {"dropped": 5, "bank": 0, "holders": "Flash, March, Monju, Kay | 1 unaccounted"},
-    "Sword": {"dropped": 5, "bank": 2, "holders": "Deepfive, Dragada, Taki"},
-    "Wand": {"dropped": 2, "bank": 1, "holders": "Aud"},
-    "Grimoire": {"dropped": 4, "bank": 1, "holders": "DJ, Kael, Jaba"},
-    "Knuckles": {"dropped": 7, "bank": 5, "holders": "Lord X, Dodre"},
-    "Bow": {"dropped": 4, "bank": 0, "holders": "Tokyo, Lockheed, Alyrie, dragonxox"},
-    "Hammer": {"dropped": 3, "bank": 0, "holders": "Rahual, Dragada, Trophy"},
-    "Dagger": {"dropped": 5, "bank": 0, "holders": "Moh x2, Cora, Furi, Roy Nexx"},
-    "Totem": {"dropped": 1, "bank": 0, "holders": "Guava"},
+    "Axe": {"dropped": 5, "bank": 0},
+    "Sword": {"dropped": 5, "bank": 2},
+    "Wand": {"dropped": 2, "bank": 1},
+    "Grimoire": {"dropped": 4, "bank": 1},
+    "Knuckles": {"dropped": 7, "bank": 5},
+    "Bow": {"dropped": 4, "bank": 0},
+    "Hammer": {"dropped": 3, "bank": 0},
+    "Dagger": {"dropped": 5, "bank": 0},
+    "Totem": {"dropped": 1, "bank": 0},
 }
 fashion_state: dict[str, dict] = {}
+fashion_meta: dict = {}
+fashion_undo_state: dict | None = None
 
 
 intents = discord.Intents.default()
@@ -501,11 +503,14 @@ ROLL_WEAPON_ALIASES = {
 
 
 def load_fashion_state() -> None:
-    global fashion_state
+    """Load the tracker and migrate the old holders-based file automatically."""
+    global fashion_state, fashion_meta, fashion_undo_state
     ensure_data_dir()
 
     if not os.path.exists(FASHION_FILE):
         fashion_state = json.loads(json.dumps(DEFAULT_FASHION_STATE))
+        fashion_meta = {}
+        fashion_undo_state = None
         save_fashion_state()
         return
 
@@ -515,20 +520,69 @@ def load_fashion_state() -> None:
     except (OSError, json.JSONDecodeError):
         raw = {}
 
+    # New format stores the board plus small audit/undo metadata. Old files had
+    # weapon names directly at the top level; both formats are accepted.
+    if isinstance(raw, dict) and isinstance(raw.get("weapons"), dict):
+        raw_weapons = raw.get("weapons", {})
+        raw_meta = raw.get("meta", {})
+        raw_undo = raw.get("undo")
+    else:
+        raw_weapons = raw if isinstance(raw, dict) else {}
+        raw_meta = {}
+        raw_undo = None
+
     fashion_state = {}
     for weapon, default in DEFAULT_FASHION_STATE.items():
-        saved = raw.get(weapon, {}) if isinstance(raw, dict) else {}
+        saved = raw_weapons.get(weapon, {}) if isinstance(raw_weapons, dict) else {}
         fashion_state[weapon] = {
             "dropped": int(saved.get("dropped", default["dropped"])),
             "bank": int(saved.get("bank", default["bank"])),
-            "holders": str(saved.get("holders", default["holders"])),
         }
+
+    fashion_meta = raw_meta if isinstance(raw_meta, dict) else {}
+
+    if isinstance(raw_undo, dict) and isinstance(raw_undo.get("weapons"), dict):
+        undo_weapons = {}
+        for weapon, default in DEFAULT_FASHION_STATE.items():
+            saved = raw_undo["weapons"].get(weapon, {})
+            undo_weapons[weapon] = {
+                "dropped": int(saved.get("dropped", default["dropped"])),
+                "bank": int(saved.get("bank", default["bank"])),
+            }
+        fashion_undo_state = {
+            "weapons": undo_weapons,
+            "meta": raw_undo.get("meta", {}) if isinstance(raw_undo.get("meta"), dict) else {},
+        }
+    else:
+        fashion_undo_state = None
 
 
 def save_fashion_state() -> None:
     ensure_data_dir()
+    payload = {
+        "version": 2,
+        "weapons": fashion_state,
+        "meta": fashion_meta,
+        "undo": fashion_undo_state,
+    }
     with open(FASHION_FILE, "w", encoding="utf-8") as f:
-        json.dump(fashion_state, f, indent=2)
+        json.dump(payload, f, indent=2)
+
+
+def fashion_snapshot() -> dict:
+    return {
+        "weapons": json.loads(json.dumps(fashion_state)),
+        "meta": json.loads(json.dumps(fashion_meta)),
+    }
+
+
+def set_fashion_updated_by(user: discord.Member | discord.User) -> None:
+    fashion_meta["last_updated_by_id"] = int(user.id)
+    fashion_meta["last_updated_by_name"] = (
+        getattr(user, "display_name", None)
+        or getattr(user, "name", "Unknown")
+    )
+    fashion_meta["last_updated_at"] = dt_to_str(utcnow())
 
 
 def build_fashion_embed() -> discord.Embed:
@@ -536,11 +590,8 @@ def build_fashion_embed() -> discord.Embed:
     total_bank = sum(int(v.get("bank", 0)) for v in fashion_state.values())
 
     embed = discord.Embed(
-        title="✨ Dhio Fashion Weapon Tracker",
-        description=(
-            "Current fashion weapon drops and bank inventory.\n"
-            "Leaders can use the weapon buttons below to update the board."
-        ),
+        title="✨ Dhiothu Fashion Weapon Tracker",
+        description=f"**Total dropped:** {total_dropped}  •  **In bank:** {total_bank}",
     )
 
     for weapon in DEFAULT_FASHION_STATE:
@@ -554,9 +605,15 @@ def build_fashion_embed() -> discord.Embed:
             inline=False,
         )
 
-    embed.set_footer(
-        text=f"Total dropped: {total_dropped} • In bank: {total_bank} • Use buttons to edit"
-    )
+    updated_at = str_to_dt(fashion_meta.get("last_updated_at"))
+    updated_name = str(fashion_meta.get("last_updated_by_name", "")).strip()
+    if updated_at and updated_name:
+        # Discord renders embed timestamps in each viewer's local timezone.
+        embed.set_footer(text=f"Last updated by {updated_name}")
+        embed.timestamp = updated_at
+    else:
+        embed.set_footer(text="Last updated: not yet recorded")
+
     return embed
 
 
@@ -578,19 +635,12 @@ class FashionEditModal(discord.ui.Modal):
             required=True,
             max_length=4,
         )
-        self.holders = discord.ui.TextInput(
-            label="Current holders",
-            default=str(data.get("holders", "")),
-            placeholder="Example: Aud, Dragada, Trophy",
-            required=False,
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-        )
         self.add_item(self.dropped)
         self.add_item(self.bank)
-        self.add_item(self.holders)
 
     async def on_submit(self, interaction: discord.Interaction):
+        global fashion_undo_state
+
         if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
             await interaction.response.send_message(
                 "Only leaders can edit the fashion tracker.", ephemeral=True
@@ -618,11 +668,20 @@ class FashionEditModal(discord.ui.Modal):
             )
             return
 
+        current = fashion_state.get(self.weapon, DEFAULT_FASHION_STATE[self.weapon])
+        if int(current.get("dropped", 0)) == dropped and int(current.get("bank", 0)) == bank:
+            await interaction.response.send_message(
+                "No changes were made.", ephemeral=True
+            )
+            return
+
+        # One-level safety net: every real edit replaces the previous undo snapshot.
+        fashion_undo_state = fashion_snapshot()
         fashion_state[self.weapon] = {
             "dropped": dropped,
             "bank": bank,
-            "holders": str(self.holders.value).strip(),
         }
+        set_fashion_updated_by(interaction.user)
         save_fashion_state()
 
         await interaction.response.edit_message(
@@ -660,6 +719,57 @@ class FashionTrackerView(discord.ui.View):
             # Five buttons max per Discord action row.
             self.add_item(FashionWeaponButton(weapon, row=0 if index < 5 else 1))
 
+        undo_button = discord.ui.Button(
+            label="Undo Last Update",
+            emoji="↩️",
+            style=discord.ButtonStyle.danger,
+            custom_id="bidbot_fashion_undo",
+            row=2,
+        )
+        undo_button.callback = self.undo_last_update
+        self.add_item(undo_button)
+
+    async def undo_last_update(self, interaction: discord.Interaction):
+        global fashion_state, fashion_meta, fashion_undo_state
+
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can undo fashion tracker updates.", ephemeral=True
+            )
+            return
+
+        if not fashion_undo_state:
+            await interaction.response.send_message(
+                "There is no fashion board update to undo.", ephemeral=True
+            )
+            return
+
+        previous = fashion_undo_state
+        fashion_state = json.loads(json.dumps(previous.get("weapons", DEFAULT_FASHION_STATE)))
+        # The undo itself becomes the newest board update for the audit footer.
+        fashion_meta = previous.get("meta", {}) if isinstance(previous.get("meta"), dict) else {}
+        set_fashion_updated_by(interaction.user)
+        fashion_undo_state = None
+        save_fashion_state()
+
+        await interaction.response.edit_message(
+            embed=build_fashion_embed(),
+            view=FashionTrackerView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+
+async def slash_send(interaction: discord.Interaction, *args, **kwargs):
+    """Send a slash-command response and return the created message when possible."""
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, wait=True, **kwargs)
+
+    await interaction.response.send_message(*args, **kwargs)
+    try:
+        return await interaction.original_response()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Roll helpers
@@ -996,8 +1106,8 @@ def get_filtered_roll_awards(
 ) -> list[dict]:
     """Filter the award log.
 
-    %rollawards uses the default (active/current items only).
-    %rollaudit passes include_returned=True for the permanent history.
+    /rollawards uses the default (active/current items only).
+    /rollaudit passes include_returned=True for the permanent history.
     """
     normalized_item = normalize_item_name(item_query)
     entries = []
@@ -1088,7 +1198,7 @@ def build_roll_awards_content(
     member_id: int | None = None,
     item_query: str | None = None,
 ) -> str:
-    """Build the clean current-ownership view used by %rollawards."""
+    """Build the clean current-ownership view used by /rollawards."""
     total = len(entries)
     total_pages = max((total + per_page - 1) // per_page, 1)
     page = min(max(page, 0), total_pages - 1)
@@ -1132,7 +1242,7 @@ def build_roll_audit_content(
     member_id: int | None = None,
     item_query: str | None = None,
 ) -> str:
-    """Build the permanent detailed history used by %rollaudit."""
+    """Build the permanent detailed history used by /rollaudit."""
     total = len(entries)
     total_pages = max((total + per_page - 1) // per_page, 1)
     page = min(max(page, 0), total_pages - 1)
@@ -1208,7 +1318,7 @@ def build_roll_awards_embed(
     item_query: str | None = None,
     highlight_log_id: int | None = None,
 ) -> discord.Embed:
-    """Build the clean current-ownership embed used by %rollawards.
+    """Build the clean current-ownership embed used by /rollawards.
 
     List numbers are stable within the current filtered result set so leaders can
     use the Return Item button and enter the visible list number.
@@ -1308,7 +1418,7 @@ def build_roll_audit_embed(
     member_id: int | None = None,
     item_query: str | None = None,
 ) -> discord.Embed:
-    """Build the permanent detailed history embed used by %rollaudit."""
+    """Build the permanent detailed history embed used by /rollaudit."""
     total = len(entries)
     total_pages = max((total + per_page - 1) // per_page, 1)
     page = min(max(page, 0), total_pages - 1)
@@ -1869,7 +1979,7 @@ async def process_award_return(
     embed.add_field(name="Previous holder", value=f"<@{winner_id}>", inline=True)
     embed.add_field(
         name="Status",
-        value="Removed from `%rollawards` • Kept in `%rollaudit` as returned",
+        value="Removed from `/rollawards` • Kept in `/rollaudit` as returned",
         inline=False,
     )
     return embed
@@ -1917,7 +2027,7 @@ class RollAwardReturnModal(discord.ui.Modal, title="Return Roll Award"):
 
         if target_award is None:
             await interaction.response.send_message(
-                "That item is no longer a current award. Run `%rollawards @Player` again to refresh the list.",
+                "That item is no longer a current award. Run `/rollawards member:@Player` again to refresh the list.",
                 ephemeral=True,
             )
             return
@@ -2025,7 +2135,7 @@ class RollAwardsView(discord.ui.View):
         message = (
             "Only leaders can use these award controls."
             if self.can_return
-            else "Run `%rollawards` yourself to browse this list."
+            else "Run `/rollawards` yourself to browse this list."
         )
         await interaction.response.send_message(message, ephemeral=True)
         return False
@@ -2135,7 +2245,7 @@ class RollAuditView(discord.ui.View):
             return True
 
         await interaction.response.send_message(
-            "Run `%rollaudit` yourself to browse the audit.",
+            "Run `/rollaudit` yourself to browse the audit.",
             ephemeral=True,
         )
         return False
@@ -2277,10 +2387,6 @@ async def on_message(message: discord.Message):
         "%pay",
         "%undo",
         "%refund",
-        "%recordaward",
-        "%rollawards",
-        "%rollaudit",
-        "%returnaward",
     )
 
     if any(content.startswith(prefix) for prefix in ALLOWED_THREAD_PREFIXES):
@@ -2595,18 +2701,19 @@ async def roll(
     await sent.edit(content=build_roll_panel_content(roll_state[sent.id], sent.id), view=RollView())
 
 
-@bot.command(name="weaponcheck")
-async def weaponcheck(ctx: commands.Context, member: discord.Member | None = None):
+@bot.tree.command(name="weaponcheck", description="Show how a player's current weapon awards are classified")
+@app_commands.describe(member="Player to check. Defaults to you.")
+async def weaponcheck(interaction: discord.Interaction, member: discord.Member | None = None):
     """Leader-only audit showing exactly how active award names are classified."""
-    if ctx.guild is None or not is_leader(ctx.author, ctx.guild):
-        await ctx.reply("Only leaders can use `%weaponcheck`.", mention_author=False)
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can use `/weaponcheck`.", ephemeral=True)
         return
 
-    member = member or ctx.author
+    member = member or interaction.user
     active_entries = [
         entry
         for entry in award_log
-        if int(entry.get("guild_id", 0)) == ctx.guild.id
+        if int(entry.get("guild_id", 0)) == interaction.guild.id
         and int(entry.get("winner_user_id", 0)) == member.id
         and not award_is_returned(entry)
     ]
@@ -2655,12 +2762,12 @@ async def weaponcheck(ctx: commands.Context, member: discord.Member | None = Non
         "Aliases: Dhio / Dino / Dhino / Voidsworn → **Dhiothu**",
     ])
 
-    await ctx.reply(
+    await slash_send(
+        interaction,
         "\n".join(lines),
-        mention_author=False,
+        ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
 
 @bot.tree.command(name="funroll", description="Open a simple unrestricted fun roll")
 @app_commands.describe(
@@ -2749,67 +2856,39 @@ async def closeroll(interaction: discord.Interaction, roll_id: str):
         ephemeral=True,
     )
 
-@bot.command(name="recordaward")
+@bot.tree.command(name="recordaward", description="Record the winner of a completed roll")
+@app_commands.describe(
+    winner="Optional winner override. Leave blank to use the highest roll.",
+    roll_id="Optional Roll ID. Usually leave blank when running inside the roll thread.",
+)
 async def recordaward(
-    ctx: commands.Context,
-    *,
-    arguments: str = "",
+    interaction: discord.Interaction,
+    winner: discord.Member | None = None,
+    roll_id: str | None = None,
 ):
-    """
-    Record a completed roll award from the current item thread.
-
-    Normal usage:
-      %recordaward
-      %recordaward @winner
-
-    Optional explicit Roll ID fallback:
-      %recordaward <roll_id>
-      %recordaward <roll_id> @winner
-    """
-    if not is_allowed_channel(ctx.channel):
-        await ctx.send("Use this in an allowed bid or roll channel.")
+    if not is_allowed_channel(interaction.channel):
+        await slash_send(interaction, "Use this in an allowed bid or roll channel.", ephemeral=True)
         return
 
-    if ctx.guild is None or not is_leader(ctx.author, ctx.guild):
-        await ctx.send("Only leaders can record roll awards.")
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can record roll awards.", ephemeral=True)
         return
 
     explicit_roll_id: int | None = None
-    invalid_arguments: list[str] = []
-
-    for token in arguments.split():
-        # Discord member mentions are resolved from ctx.message.mentions below.
-        if token.startswith("<@") and token.endswith(">"):
-            continue
-
-        if token.isdigit() and explicit_roll_id is None:
-            explicit_roll_id = int(token)
-            continue
-
-        invalid_arguments.append(token)
-
-    if invalid_arguments:
-        await ctx.send(
-            "Usage: `%recordaward`, `%recordaward @Player`, or optionally "
-            "`%recordaward <roll_id> @Player`."
-        )
-        return
-
-    winner: discord.Member | None = None
-    if ctx.message.mentions:
-        mentioned_user = ctx.message.mentions[0]
-        if isinstance(mentioned_user, discord.Member):
-            winner = mentioned_user
-        else:
-            winner = ctx.guild.get_member(mentioned_user.id)
+    if roll_id is not None and roll_id.strip():
+        try:
+            explicit_roll_id = int(roll_id.strip())
+        except ValueError:
+            await slash_send(interaction, "Roll ID must be the number shown on the roll panel.", ephemeral=True)
+            return
 
     if explicit_roll_id is not None:
         parsed_roll_id = explicit_roll_id
         state = get_roll_state(parsed_roll_id)
     else:
-        channel_roll = get_roll_for_channel(ctx.channel.id, ctx.guild.id)
+        channel_roll = get_roll_for_channel(interaction.channel.id, interaction.guild.id)
         if channel_roll is None:
-            await ctx.send(
+            await slash_send(interaction, 
                 "I could not find a roll connected to this thread. Run the "
                 "command inside the item thread containing the roll panel."
             )
@@ -2818,12 +2897,12 @@ async def recordaward(
         parsed_roll_id, state = channel_roll
 
     if state is None:
-        await ctx.send("That roll could not be found.")
+        await slash_send(interaction, "That roll could not be found.")
         return
 
     state_guild_id = state.get("guild_id")
-    if state_guild_id and int(state_guild_id) != ctx.guild.id:
-        await ctx.send("That roll belongs to a different server.")
+    if state_guild_id and int(state_guild_id) != interaction.guild.id:
+        await slash_send(interaction, "That roll belongs to a different server.")
         return
 
     existing_award = get_award_for_roll(parsed_roll_id)
@@ -2833,7 +2912,7 @@ async def recordaward(
             if existing_award is not None
             else state.get("award_log_id", "?")
         )
-        await ctx.send(
+        await slash_send(interaction, 
             f"That roll is already recorded as Award **#{award_number}**."
         )
         return
@@ -2845,7 +2924,7 @@ async def recordaward(
         if closes_at and utcnow() >= closes_at:
             needs_close = True
         else:
-            await ctx.send(
+            await slash_send(interaction, 
                 "That roll is still open. Close it before recording the award."
             )
             return
@@ -2856,9 +2935,9 @@ async def recordaward(
 
     if winner is None:
         if not sorted_rolls:
-            await ctx.send(
+            await slash_send(interaction, 
                 "That roll has no recorded participants. If the item is being "
-                "given to someone anyway, use `%recordaward @Player`."
+                "given to someone anyway, use `/recordaward winner:@Player`."
             )
             return
 
@@ -2872,9 +2951,9 @@ async def recordaward(
                 f"<@{int(roll.get('user_id', 0))}>"
                 for roll in highest_rollers
             )
-            await ctx.send(
+            await slash_send(interaction, 
                 "This roll ended in a tie between "
-                f"{tied_names}. Run `%recordaward @winner` in this thread "
+                f"{tied_names}. Run `/recordaward winner:@Player` in this thread "
                 "and mention the person receiving the item.",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -2882,7 +2961,7 @@ async def recordaward(
 
         selected_roll = highest_rollers[0]
         winner_user_id = int(selected_roll.get("user_id", 0))
-        winner_member = ctx.guild.get_member(winner_user_id)
+        winner_member = interaction.guild.get_member(winner_user_id)
     else:
         selected_roll = rolls.get(str(winner.id))
         winner_user_id = winner.id
@@ -2907,7 +2986,7 @@ async def recordaward(
 
     if winner_member is None:
         try:
-            winner_member = await ctx.guild.fetch_member(winner_user_id)
+            winner_member = await interaction.guild.fetch_member(winner_user_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             winner_member = None
 
@@ -2932,9 +3011,9 @@ async def recordaward(
         "winning_roll": selected_roll.get("roll"),
         "selection_method": selection_method,
         "awarded_at": dt_to_str(now),
-        "recorded_by_user_id": ctx.author.id,
-        "recorded_by_name": getattr(ctx.author, "display_name", ctx.author.name),
-        "guild_id": ctx.guild.id,
+        "recorded_by_user_id": interaction.user.id,
+        "recorded_by_name": getattr(interaction.user, "display_name", interaction.user.name),
+        "guild_id": interaction.guild.id,
         "channel_id": state.get("channel_id"),
         "returned": False,
         "returned_at": None,
@@ -2947,7 +3026,7 @@ async def recordaward(
     state["award_log_id"] = log_id
     state["award_winner_user_id"] = winner_user_id
     state["award_recorded_at"] = dt_to_str(now)
-    state["award_recorded_by"] = ctx.author.id
+    state["award_recorded_by"] = interaction.user.id
     save_state()
 
     channel_id = state.get("channel_id")
@@ -2973,13 +3052,13 @@ async def recordaward(
     # This lets leaders see previous wins and refund/return one without running
     # another command. The newly recorded award is marked in the list.
     winner_entries = get_filtered_roll_awards(
-        guild_id=ctx.guild.id,
+        guild_id=interaction.guild.id,
         member_id=winner_user_id,
         include_returned=False,
     )
 
     view = RollAwardsView(
-        requester_id=ctx.author.id,
+        requester_id=interaction.user.id,
         entries=winner_entries,
         member_id=winner_user_id,
         per_page=15,
@@ -2987,37 +3066,32 @@ async def recordaward(
         highlight_log_id=log_id,
     )
 
-    sent = await ctx.send(
+    sent = await slash_send(interaction, 
         embed=view.embed(),
         view=view,
         allowed_mentions=discord.AllowedMentions.none(),
     )
     view.message = sent
 
-
-@bot.command(name="rollawards")
-async def rollawards(ctx: commands.Context, *, filters: str = ""):
-    """Browse current (not returned) roll awards in a clean numbered item list."""
-    if ctx.guild is None:
-        await ctx.send("This command can only be used in a server.")
+@bot.tree.command(name="rollawards", description="Browse current roll awards")
+@app_commands.describe(
+    member="Optional player to filter by",
+    item="Optional item-name filter",
+)
+async def rollawards(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    item: str | None = None,
+):
+    if interaction.guild is None:
+        await slash_send(interaction, "This command can only be used in a server.", ephemeral=True)
         return
 
-    member = ctx.message.mentions[0] if ctx.message.mentions else None
-    item_query = filters.strip()
-
-    if member is not None:
-        for mention_text in (
-            member.mention,
-            f"<@{member.id}>",
-            f"<@!{member.id}>",
-        ):
-            item_query = item_query.replace(mention_text, "")
-
-    item_query = " ".join(item_query.split()) or None
+    item_query = " ".join((item or "").split()) or None
     member_id = member.id if member is not None else None
 
     entries = get_filtered_roll_awards(
-        guild_id=ctx.guild.id,
+        guild_id=interaction.guild.id,
         member_id=member_id,
         item_query=item_query,
         include_returned=False,
@@ -3025,14 +3099,14 @@ async def rollawards(ctx: commands.Context, *, filters: str = ""):
 
     can_return = (
         member_id is not None
-        and is_leader(ctx.author, ctx.guild)
+        and is_leader(interaction.user, interaction.guild)
         and len(entries) > 0
     )
 
     view = None
     if len(entries) > 15 or can_return:
         view = RollAwardsView(
-            requester_id=ctx.author.id,
+            requester_id=interaction.user.id,
             entries=entries,
             member_id=member_id,
             item_query=item_query,
@@ -3048,7 +3122,8 @@ async def rollawards(ctx: commands.Context, *, filters: str = ""):
         item_query=item_query,
     )
 
-    sent = await ctx.send(
+    sent = await slash_send(
+        interaction,
         embed=embed,
         view=view,
         allowed_mentions=discord.AllowedMentions.none(),
@@ -3057,30 +3132,25 @@ async def rollawards(ctx: commands.Context, *, filters: str = ""):
     if view is not None:
         view.message = sent
 
-
-@bot.command(name="rollaudit")
-async def rollaudit(ctx: commands.Context, *, filters: str = ""):
-    """Leader-only permanent roll award history, including returns."""
-    if ctx.guild is None or not is_leader(ctx.author, ctx.guild):
-        await ctx.send("Only leaders can view the roll audit.")
+@bot.tree.command(name="rollaudit", description="View permanent roll award history, including returns")
+@app_commands.describe(
+    member="Optional player to filter by",
+    item="Optional item-name filter",
+)
+async def rollaudit(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    item: str | None = None,
+):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can view the roll audit.", ephemeral=True)
         return
 
-    member = ctx.message.mentions[0] if ctx.message.mentions else None
-    item_query = filters.strip()
-
-    if member is not None:
-        for mention_text in (
-            member.mention,
-            f"<@{member.id}>",
-            f"<@!{member.id}>",
-        ):
-            item_query = item_query.replace(mention_text, "")
-
-    item_query = " ".join(item_query.split()) or None
+    item_query = " ".join((item or "").split()) or None
     member_id = member.id if member is not None else None
 
     entries = get_filtered_roll_awards(
-        guild_id=ctx.guild.id,
+        guild_id=interaction.guild.id,
         member_id=member_id,
         item_query=item_query,
         include_returned=True,
@@ -3089,7 +3159,7 @@ async def rollaudit(ctx: commands.Context, *, filters: str = ""):
     view = None
     if len(entries) > 6:
         view = RollAuditView(
-            requester_id=ctx.author.id,
+            requester_id=interaction.user.id,
             entries=entries,
             member_id=member_id,
             item_query=item_query,
@@ -3104,134 +3174,123 @@ async def rollaudit(ctx: commands.Context, *, filters: str = ""):
         item_query=item_query,
     )
 
-    await ctx.send(
+    await slash_send(
+        interaction,
         embed=embed,
         view=view,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
-
-@bot.command(name="returnaward")
-async def returnaward(ctx: commands.Context, *, arguments: str = ""):
-    """Mark an award as returned without deleting its audit history.
-
-    Usage:
-      %returnaward                     -> current item thread
-      %returnaward <award_log_id>      -> exact audit award from anywhere
-      %returnaward @Player <list #>    -> return by the numbered %rollawards list
-
-    Leaders can also run %rollawards @Player and use the Return Item button.
-    """
-    if ctx.guild is None or not is_leader(ctx.author, ctx.guild):
-        await ctx.send("Only leaders can return roll awards.")
+@bot.tree.command(name="returnaward", description="Mark a current roll award as returned")
+@app_commands.describe(
+    award_number="Exact award # from the audit",
+    member="Player whose current-item list you want to use",
+    list_number="Item number shown by /rollawards for that player",
+    item="Optional item-name match for that player",
+)
+async def returnaward(
+    interaction: discord.Interaction,
+    award_number: int | None = None,
+    member: discord.Member | None = None,
+    list_number: int | None = None,
+    item: str | None = None,
+):
+    """Return by current thread, exact award #, or player + list number/item."""
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can return roll awards.", ephemeral=True)
         return
 
-    raw = arguments.strip()
+    supplied_modes = sum([
+        award_number is not None,
+        member is not None or list_number is not None or bool((item or "").strip()),
+    ])
+    if award_number is not None and (member is not None or list_number is not None or (item or "").strip()):
+        await slash_send(
+            interaction,
+            "Use either **award_number** OR the player/list fields, not both.",
+            ephemeral=True,
+        )
+        return
+
     target_award: dict | None = None
 
-    if not raw:
-        target_award = get_active_award_for_channel(ctx.channel.id, ctx.guild.id)
+    if award_number is not None:
+        target_award = get_active_award_by_log_id(interaction.guild.id, award_number)
         if target_award is None:
-            await ctx.send(
-                "I couldn't find a current award tied to this channel/thread. "
-                "Use `%rollawards @Player` and the **Return Item** button, or "
-                "`%returnaward <award #>` for an exact audit award."
+            await slash_send(
+                interaction,
+                "That award number was not found, belongs to another server, or has already been returned.",
+                ephemeral=True,
             )
             return
 
-    else:
-        log_id_text = raw.lstrip("#").strip()
-        if log_id_text.isdigit():
-            target_award = get_active_award_by_log_id(
-                ctx.guild.id,
-                int(log_id_text),
+    elif member is not None:
+        player_entries = get_filtered_roll_awards(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            include_returned=False,
+        )
+
+        if list_number is not None:
+            if list_number < 1 or list_number > len(player_entries):
+                await slash_send(
+                    interaction,
+                    f"That player has **{len(player_entries)}** current items. Choose a list number from 1–{len(player_entries)}.",
+                    ephemeral=True,
+                )
+                return
+            target_award = player_entries[list_number - 1]
+        elif (item or "").strip():
+            matches = get_filtered_roll_awards(
+                guild_id=interaction.guild.id,
+                member_id=member.id,
+                item_query=(item or "").strip(),
+                include_returned=False,
             )
-            if target_award is None:
-                await ctx.send(
-                    "That award number was not found, belongs to another server, "
-                    "or has already been returned."
+            if not matches:
+                await slash_send(interaction, "I couldn't find a current award matching that item.", ephemeral=True)
+                return
+            if len(matches) > 1:
+                await slash_send(
+                    interaction,
+                    "That matches more than one item. Use `/rollawards member:@Player` and enter the visible **list_number** instead.",
+                    ephemeral=True,
                 )
                 return
+            target_award = matches[0]
         else:
-            member = ctx.message.mentions[0] if ctx.message.mentions else None
-            if member is None:
-                await ctx.send(
-                    "Usage: `%returnaward` in the item thread, "
-                    "`%returnaward <award #>`, or `%returnaward @Player <list #>`."
-                )
-                return
+            await slash_send(
+                interaction,
+                "Choose a **list_number** or enter an **item** when selecting a player.",
+                ephemeral=True,
+            )
+            return
 
-            item_query = raw
-            for mention_text in (
-                member.mention,
-                f"<@{member.id}>",
-                f"<@!{member.id}>",
-            ):
-                item_query = item_query.replace(mention_text, "")
-            item_query = " ".join(item_query.split())
-
-            if not item_query:
-                await ctx.send(
-                    "Run `%rollawards @Player` and use the **Return Item** button, "
-                    "or include the numbered list item like `%returnaward @Player 2`."
-                )
-                return
-
-            # Preferred manual fallback: use the visible list number from
-            # %rollawards @Player instead of retyping the item name.
-            list_number_text = item_query.lstrip("#").strip()
-            if list_number_text.isdigit():
-                player_entries = get_filtered_roll_awards(
-                    guild_id=ctx.guild.id,
-                    member_id=member.id,
-                    include_returned=False,
-                )
-                list_number = int(list_number_text)
-                if list_number < 1 or list_number > len(player_entries):
-                    await ctx.send(
-                        f"That player has **{len(player_entries)}** current items. "
-                        f"Choose a list number from 1–{len(player_entries)}."
-                    )
-                    return
-                target_award = player_entries[list_number - 1]
-            else:
-                # Keep item-name matching as a backwards-compatible fallback.
-                matches = get_filtered_roll_awards(
-                    guild_id=ctx.guild.id,
-                    member_id=member.id,
-                    item_query=item_query,
-                    include_returned=False,
-                )
-
-                if not matches:
-                    await ctx.send(
-                        f"I couldn't find a current award for <@{member.id}> matching "
-                        f"**{discord.utils.escape_markdown(item_query)}**.",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-
-                if len(matches) > 1:
-                    await ctx.send(
-                        "That matches more than one item. Run `%rollawards @Player` "
-                        "and use the numbered list instead.",
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-
-                target_award = matches[0]
-
-    if target_award is None:
-        await ctx.send("I couldn't find that award.")
+    elif list_number is not None or (item or "").strip():
+        await slash_send(interaction, "Choose a **member** when using list_number or item.", ephemeral=True)
         return
+
+    else:
+        if interaction.channel is None:
+            await slash_send(interaction, "Channel not found.", ephemeral=True)
+            return
+        target_award = get_active_award_for_channel(interaction.channel.id, interaction.guild.id)
+        if target_award is None:
+            await slash_send(
+                interaction,
+                "I couldn't find a current award tied to this channel/thread. Use `/rollawards` or provide an award number.",
+                ephemeral=True,
+            )
+            return
 
     try:
-        embed = await process_award_return(ctx.guild, ctx.author, target_award)
+        embed = await process_award_return(interaction.guild, interaction.user, target_award)
     except ValueError as exc:
-        await ctx.send(str(exc))
+        await slash_send(interaction, str(exc), ephemeral=True)
         return
 
-    await ctx.send(
+    await slash_send(
+        interaction,
         embed=embed,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -4373,7 +4432,7 @@ async def closebid(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="fashionboard",
-    description="Post the editable Dhio fashion weapon tracker",
+    description="Post the editable Dhiothu fashion weapon tracker",
 )
 async def fashionboard(interaction: discord.Interaction):
     if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
