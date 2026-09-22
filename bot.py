@@ -1529,12 +1529,18 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
     mode = state.get("roll_mode", "fun")
 
     status = "Closed" if closed else "Open"
-    if closed:
-        time_left = "Closed"
-    elif mode == "weapon" and int(state.get("phase", 1)) == 1:
-        time_left = display_time_left(state.get("phase1_ends_at"))
-    else:
-        time_left = display_time_left(state.get("closes_at"))
+
+    # Weapon rolls use Discord's live Unix/relative timestamp instead of a
+    # manually calculated "Time left" value. Discord updates <t:...:R>
+    # automatically for each viewer.
+    phase_end_text = None
+    if mode == "weapon" and not closed:
+        phase = int(state.get("phase", 1))
+        phase_end = str_to_dt(
+            state.get("phase1_ends_at") if phase == 1 else state.get("closes_at")
+        )
+        if phase_end:
+            phase_end_text = f"<t:{int(phase_end.timestamp())}:R>"
 
     lines = [
         f"🎲 **Roll {status} — {title}**",
@@ -1550,7 +1556,7 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
         weapon = state.get("weapon_type", "Unknown")
         lines.extend([
             f"Boss: **{boss}** • Weapon: **{weapon}**",
-            f"Phase: **{phase}**",
+            f"Phase: **{phase}**" + (f" • Ends {phase_end_text}" if phase_end_text else ""),
             "",
             "**Rules:**",
         ])
@@ -1577,10 +1583,13 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
             "• Highest roll wins",
         ])
 
-    lines.extend([
-        f"• Time left: **{time_left}**",
-        f"• Total accepted rolls: **{len(rolls)}**",
-    ])
+    if mode == "weapon":
+        lines.append(f"• Total accepted rolls: **{len(rolls)}**")
+    else:
+        closes_at = str_to_dt(state.get("closes_at"))
+        if not closed and closes_at:
+            lines.append(f"• Ends <t:{int(closes_at.timestamp())}:R>")
+        lines.append(f"• Total accepted rolls: **{len(rolls)}**")
 
     if sorted_rolls:
         top = sorted_rolls[0]
@@ -1614,12 +1623,15 @@ def build_roll_info_content(state: dict, roll_id: int, viewer_id: int | None = N
 
     status = "Closed" if closed else "Open"
     mode = state.get("roll_mode", "fun")
-    if closed:
-        time_left = "Closed"
-    elif mode == "weapon" and int(state.get("phase", 1)) == 1:
-        time_left = display_time_left(state.get("phase1_ends_at"))
-    else:
-        time_left = display_time_left(state.get("closes_at"))
+
+    phase_end_text = None
+    if mode == "weapon" and not closed:
+        phase = int(state.get("phase", 1))
+        phase_end = str_to_dt(
+            state.get("phase1_ends_at") if phase == 1 else state.get("closes_at")
+        )
+        if phase_end:
+            phase_end_text = f"<t:{int(phase_end.timestamp())}:R>"
 
     lines = [
         f"📊 **Roll Info — {title}**",
@@ -1627,12 +1639,17 @@ def build_roll_info_content(state: dict, roll_id: int, viewer_id: int | None = N
         f"Status: **{status}**",
     ]
     if mode == "weapon":
-        lines.append(f"Phase: **{int(state.get('phase', 1))}**")
+        phase = int(state.get("phase", 1))
+        lines.append(
+            f"Phase: **{phase}**" + (f" • Ends {phase_end_text}" if phase_end_text else "")
+        )
         lines.append(f"Boss / Weapon: **{state.get('boss', 'Unknown')} / {state.get('weapon_type', 'Unknown')}**")
-    lines.extend([
-        f"Time Left: **{time_left}**",
-        f"Total Rolls: **{len(rolls)}**",
-    ])
+        lines.append(f"Total Rolls: **{len(rolls)}**")
+    else:
+        closes_at = str_to_dt(state.get("closes_at"))
+        if not closed and closes_at:
+            lines.append(f"Ends: <t:{int(closes_at.timestamp())}:R>")
+        lines.append(f"Total Rolls: **{len(rolls)}**")
 
     if sorted_rolls:
         highest_value = sorted_rolls[0].get("roll")
