@@ -271,7 +271,7 @@ def deserialize_award_log(raw) -> list[dict]:
 
 def serialize_state() -> dict:
     return {
-        "version": 5,
+        "version": 6,
         "bid_state": serialize_bid_state(),
         "roll_state": serialize_roll_state(),
         "award_log": award_log,
@@ -457,6 +457,48 @@ FASHION_EMOJIS = {
     "Totem": "🪶",
 }
 
+# Structured weapon-roll options. Add future cosmetic-dropping bosses here.
+# Historical names/abbreviations are normalized through ROLL_BOSS_ALIASES below.
+ROLL_BOSSES = [
+    "Dhiothu",
+]
+
+ROLL_BOSS_ALIASES = {
+    "dhiothu": "Dhiothu",
+    "dhio": "Dhiothu",
+    "dino": "Dhiothu",
+    "dhino": "Dhiothu",
+    "voidsworn": "Dhiothu",
+}
+
+ROLL_WEAPON_TYPES = [
+    "Bow",
+    "Knuckles",
+    "Dagger",
+    "Axe",
+    "Sword",
+    "Totem",
+    "Grimoire",
+    "Wand",
+    "Hammer",
+]
+
+ROLL_WEAPON_ALIASES = {
+    "bow": "Bow",
+    "knuckles": "Knuckles",
+    "knucks": "Knuckles",
+    "knuck": "Knuckles",
+    "dagger": "Dagger",
+    "axe": "Axe",
+    "sword": "Sword",
+    "totem": "Totem",
+    "grimoire": "Grimoire",
+    "grim": "Grimoire",
+    "grimorie": "Grimoire",
+    "wand": "Wand",
+    "hammer": "Hammer",
+}
+
 
 def load_fashion_state() -> None:
     global fashion_state
@@ -622,6 +664,211 @@ class FashionTrackerView(discord.ui.View):
 # ──────────────────────────────────────────────────────────────────────────────
 # Roll helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def canonical_boss_type(value: str | None) -> str | None:
+    """Normalize current and historical names for a cosmetic-dropping boss."""
+    text = (value or "").strip().casefold()
+    if not text:
+        return None
+    return ROLL_BOSS_ALIASES.get(text)
+
+
+def canonical_weapon_type(value: str | None) -> str | None:
+    text = (value or "").strip().casefold()
+    if not text:
+        return None
+    return ROLL_WEAPON_ALIASES.get(text)
+
+
+def award_boss_type(entry: dict) -> str | None:
+    """Return the structured/recognizable boss for a roll award.
+
+    New awards use the saved boss field. Older awards are inferred from the
+    historical item title (Dhio/Dino/Dhino/Voidsworn -> Dhiothu).
+    """
+    structured = canonical_boss_type(str(entry.get("boss", "")))
+    if structured:
+        return structured
+
+    item_text = str(entry.get("item", "")).casefold()
+    for alias, canonical in ROLL_BOSS_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", item_text):
+            return canonical
+    return None
+
+
+def award_weapon_type(entry: dict) -> str | None:
+    """Return the structured/recognizable weapon type for a roll award."""
+    structured = canonical_weapon_type(str(entry.get("weapon_type", "")))
+    if structured:
+        return structured
+
+    normalized = normalize_item_name(str(entry.get("item", "")))
+    for alias, canonical in ROLL_WEAPON_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", normalized):
+            return canonical
+    return None
+
+
+def get_player_weapon_awards(
+    guild_id: int,
+    user_id: int,
+    boss: str | None = None,
+) -> list[dict]:
+    """Current recognized weapon awards, optionally limited to one boss set.
+
+    Fun/non-weapon prizes never affect eligibility. When boss is supplied, only
+    awards recognized as belonging to that same boss are counted.
+    """
+    wanted_boss = canonical_boss_type(boss) if boss else None
+    entries = [
+        entry
+        for entry in award_log
+        if int(entry.get("guild_id", 0)) == guild_id
+        and int(entry.get("winner_user_id", 0)) == user_id
+        and not award_is_returned(entry)
+        and award_weapon_type(entry) is not None
+    ]
+    if wanted_boss is not None:
+        entries = [entry for entry in entries if award_boss_type(entry) == wanted_boss]
+    return entries
+
+
+def player_has_boss_weapon_type(
+    guild_id: int,
+    user_id: int,
+    boss: str,
+    weapon_type: str,
+) -> bool:
+    """True only when the player already owns this weapon from this boss set."""
+    wanted_boss = canonical_boss_type(boss)
+    wanted_weapon = canonical_weapon_type(weapon_type)
+    if not wanted_boss or not wanted_weapon:
+        return False
+    return any(
+        award_boss_type(entry) == wanted_boss
+        and award_weapon_type(entry) == wanted_weapon
+        for entry in get_player_weapon_awards(guild_id, user_id, boss=wanted_boss)
+    )
+
+
+def roll_phase(state: dict) -> int:
+    if state.get("roll_mode") != "weapon":
+        return 0
+    return int(state.get("phase", 1))
+
+
+async def accept_roll(interaction: discord.Interaction, state: dict, roll_id: int) -> None:
+    """Record one accepted 0-100 roll and refresh the roll panel."""
+    user_id = str(interaction.user.id)
+    rolls = state.setdefault("rolls", {})
+
+    if user_id in rolls:
+        existing = rolls[user_id]
+        await interaction.response.send_message(
+            f"❌ You already rolled for **{state.get('title', 'this roll')}**.\n"
+            f"Your roll: **{existing.get('roll')}**",
+            ephemeral=True,
+        )
+        return
+
+    display_name = (
+        getattr(interaction.user, "display_name", None)
+        or getattr(interaction.user, "name", "Unknown")
+    )
+    roll_value = random.randint(0, 100)
+    rolls[user_id] = {
+        "user_id": interaction.user.id,
+        "display_name": display_name,
+        "roll": roll_value,
+        "timestamp": dt_to_str(utcnow()),
+        "phase": roll_phase(state) or None,
+    }
+    save_state()
+
+    await interaction.response.send_message(
+        f"🎲 **{display_name}** rolled **{roll_value}** for **{state.get('title', 'Roll')}**.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    if interaction.message is not None:
+        try:
+            await interaction.message.edit(
+                content=build_roll_panel_content(state, roll_id),
+                view=RollView(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+class OneAwardReminderView(discord.ui.View):
+    """Reminder-only prompt. No return/swap decision is persisted."""
+    def __init__(self, user_id: int, roll_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.roll_id = roll_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "This reminder belongs to the player who clicked Roll.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_roll_state(self.roll_id)
+        if state is None or state.get("closed"):
+            await interaction.response.edit_message(content="This roll is no longer open.", view=None)
+            return
+        if roll_phase(state) != 1:
+            await interaction.response.edit_message(content="Phase 1 has ended.", view=None)
+            return
+        if str(interaction.user.id) in state.setdefault("rolls", {}):
+            existing = state["rolls"][str(interaction.user.id)]
+            await interaction.response.edit_message(
+                content=f"You already rolled **{existing.get('roll')}**.",
+                view=None,
+            )
+            return
+
+        display_name = getattr(interaction.user, "display_name", getattr(interaction.user, "name", "Unknown"))
+        value = random.randint(0, 100)
+        state["rolls"][str(interaction.user.id)] = {
+            "user_id": interaction.user.id,
+            "display_name": display_name,
+            "roll": value,
+            "timestamp": dt_to_str(utcnow()),
+            "phase": 1,
+        }
+        save_state()
+        await interaction.response.edit_message(
+            content=f"🎲 **{display_name}** rolled **{value}** for **{state.get('title', 'Roll')}**.",
+            view=None,
+        )
+        channel_id = state.get("channel_id")
+        channel = bot.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+        if channel is not None:
+            try:
+                msg = await channel.fetch_message(self.roll_id)
+                await msg.edit(content=build_roll_panel_content(state, self.roll_id), view=RollView())
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Roll declined. Your current award stays with you.",
+            view=None,
+        )
 
 
 def display_time_left(closes_at_text: str | None) -> str:
@@ -1143,9 +1390,15 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
     closed = state.get("closed", False)
     rolls = state.get("rolls", {})
     sorted_rolls = get_sorted_rolls(state)
+    mode = state.get("roll_mode", "fun")
 
     status = "Closed" if closed else "Open"
-    time_left = "Closed" if closed else display_time_left(state.get("closes_at"))
+    if closed:
+        time_left = "Closed"
+    elif mode == "weapon" and int(state.get("phase", 1)) == 1:
+        time_left = display_time_left(state.get("phase1_ends_at"))
+    else:
+        time_left = display_time_left(state.get("closes_at"))
 
     lines = [
         f"🎲 **Roll {status} — {title}**",
@@ -1153,21 +1406,51 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
         "",
         "Click **Roll** to roll 0–100.",
         "",
-        "**Rules:**",
-        "• 1 roll per person",
-        "• Highest roll wins",
-        f"• Time left: **{time_left}**",
-        f"• Total rolls: **{len(rolls)}**",
     ]
+
+    if mode == "weapon":
+        phase = int(state.get("phase", 1))
+        boss = state.get("boss", "Unknown")
+        weapon = state.get("weapon_type", "Unknown")
+        lines.extend([
+            f"Boss: **{boss}** • Weapon: **{weapon}**",
+            f"Phase: **{phase}**",
+            "",
+            "**Rules:**",
+        ])
+        if phase == 1:
+            lines.extend([
+                "• Phase 1 runs from hour 0–12",
+                "• 0 current weapon awards → roll accepted",
+                "• 1 current weapon award → reminder asks if you would return it for this item",
+                "• 2+ current weapon awards → wait for Phase 2",
+                "• If anyone qualifies in Phase 1, the roll closes at 12 hours",
+            ])
+        else:
+            lines.extend([
+                "• Phase 2 runs from hour 12–24",
+                "• Phase 2 only opens if Phase 1 had zero accepted rolls",
+                f"• Already own a **{weapon}** → roll declined",
+                f"• Do not own a **{weapon}** → roll accepted",
+            ])
+    else:
+        lines.extend([
+            "**Fun Roll:**",
+            "• 1 roll per person",
+            "• Highest roll wins",
+        ])
+
+    lines.extend([
+        f"• Time left: **{time_left}**",
+        f"• Total accepted rolls: **{len(rolls)}**",
+    ])
 
     if sorted_rolls:
         top = sorted_rolls[0]
-        lines.extend(
-            [
-                "",
-                f"Current highest: **{top.get('display_name', 'Unknown')} — {top.get('roll')}**",
-            ]
-        )
+        lines.extend([
+            "",
+            f"Current highest: **{top.get('display_name', 'Unknown')} — {top.get('roll')}**",
+        ])
 
     if state.get("award_recorded"):
         winner_id = state.get("award_winner_user_id")
@@ -1177,21 +1460,11 @@ def build_roll_panel_content(state: dict, roll_id: int) -> str:
             state.get("award_returned", False)
             or (recorded_award is not None and award_is_returned(recorded_award))
         )
-
-        if was_returned:
-            lines.extend(
-                [
-                    "",
-                    f"↩️ Award **#{award_log_id}** was returned.",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    "",
-                    f"🏆 Award recorded to <@{winner_id}> as Award **#{award_log_id}**.",
-                ]
-            )
+        lines.extend([
+            "",
+            f"↩️ Award **#{award_log_id}** was returned." if was_returned
+            else f"🏆 Award recorded to <@{winner_id}> as Award **#{award_log_id}**.",
+        ])
 
     return "\n".join(lines)
 
@@ -1203,15 +1476,26 @@ def build_roll_info_content(state: dict, roll_id: int, viewer_id: int | None = N
     sorted_rolls = get_sorted_rolls(state)
 
     status = "Closed" if closed else "Open"
-    time_left = "Closed" if closed else display_time_left(state.get("closes_at"))
+    mode = state.get("roll_mode", "fun")
+    if closed:
+        time_left = "Closed"
+    elif mode == "weapon" and int(state.get("phase", 1)) == 1:
+        time_left = display_time_left(state.get("phase1_ends_at"))
+    else:
+        time_left = display_time_left(state.get("closes_at"))
 
     lines = [
         f"📊 **Roll Info — {title}**",
         f"Roll ID: `{roll_id}`",
         f"Status: **{status}**",
+    ]
+    if mode == "weapon":
+        lines.append(f"Phase: **{int(state.get('phase', 1))}**")
+        lines.append(f"Boss / Weapon: **{state.get('boss', 'Unknown')} / {state.get('weapon_type', 'Unknown')}**")
+    lines.extend([
         f"Time Left: **{time_left}**",
         f"Total Rolls: **{len(rolls)}**",
-    ]
+    ])
 
     if sorted_rolls:
         highest_value = sorted_rolls[0].get("roll")
@@ -1363,40 +1647,48 @@ async def close_roll_window(roll_id: int, announce: bool = True) -> tuple[bool, 
 
 async def handle_roll_button(interaction: discord.Interaction):
     if interaction.message is None:
-        await interaction.response.send_message(
-            "Roll panel not found.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("Roll panel not found.", ephemeral=True)
         return
 
     roll_id = interaction.message.id
     state = get_roll_state(roll_id)
-
     if state is None:
-        await interaction.response.send_message(
-            "This roll window was not found.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("This roll window was not found.", ephemeral=True)
         return
 
-    closes_at = str_to_dt(state.get("closes_at"))
+    # Enforce the exact 12-hour boundary even between background-checker sweeps.
+    if state.get("roll_mode", "fun") == "weapon" and not state.get("closed"):
+        phase = int(state.get("phase", 1))
+        phase1_ends = str_to_dt(state.get("phase1_ends_at"))
+        if phase == 1 and phase1_ends and utcnow() >= phase1_ends:
+            if state.get("rolls"):
+                await close_roll_window(roll_id, announce=True)
+                await interaction.response.send_message(
+                    "Phase 1 ended at 12 hours and this roll is now closed.",
+                    ephemeral=True,
+                )
+                return
+            state["phase"] = 2
+            state["phase2_started_at"] = dt_to_str(phase1_ends)
+            save_state()
+            try:
+                await interaction.message.edit(
+                    content=build_roll_panel_content(state, roll_id),
+                    view=RollView(),
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
+    closes_at = str_to_dt(state.get("closes_at"))
     if state.get("closed") or (closes_at and utcnow() >= closes_at):
         if not state.get("closed"):
             await close_roll_window(roll_id, announce=True)
-
-        await interaction.response.send_message(
-            "This roll window is closed.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("This roll window is closed.", ephemeral=True)
         return
 
-    user_id = str(interaction.user.id)
-    rolls = state.setdefault("rolls", {})
-
-    if user_id in rolls:
-        existing = rolls[user_id]
-
+    user_key = str(interaction.user.id)
+    if user_key in state.setdefault("rolls", {}):
+        existing = state["rolls"][user_key]
         await interaction.response.send_message(
             f"❌ You already rolled for **{state.get('title', 'this roll')}**.\n"
             f"Your roll: **{existing.get('roll')}**",
@@ -1404,34 +1696,51 @@ async def handle_roll_button(interaction: discord.Interaction):
         )
         return
 
-    display_name = (
-        getattr(interaction.user, "display_name", None)
-        or getattr(interaction.user, "name", "Unknown")
-    )
+    # Fun rolls preserve the original unrestricted behavior.
+    if state.get("roll_mode", "fun") != "weapon":
+        await accept_roll(interaction, state, roll_id)
+        return
 
-    roll_value = random.randint(0, 100)
+    guild_id = int(state.get("guild_id", 0) or 0)
+    phase = int(state.get("phase", 1))
+    boss = str(state.get("boss", ""))
+    weapon_type = str(state.get("weapon_type", ""))
 
-    rolls[user_id] = {
-        "user_id": interaction.user.id,
-        "display_name": display_name,
-        "roll": roll_value,
-        "timestamp": dt_to_str(utcnow()),
-    }
+    if phase == 1:
+        # Phase 1 award count is per boss set. Awards from a future different
+        # boss do not reduce a player's priority on this boss's items.
+        current_awards = get_player_weapon_awards(guild_id, interaction.user.id, boss=boss)
+        count = len(current_awards)
 
-    save_state()
+        if count == 0:
+            await accept_roll(interaction, state, roll_id)
+            return
+        if count == 1:
+            await interaction.response.send_message(
+                "You already have **1 award**. Are you willing to return your previous "
+                "award to receive this one?",
+                view=OneAwardReminderView(interaction.user.id, roll_id),
+                ephemeral=True,
+            )
+            return
 
-    await interaction.response.send_message(
-        f"🎲 **{display_name}** rolled **{roll_value}** for **{state.get('title', 'Roll')}**.",
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-    try:
-        await interaction.message.edit(
-            content=build_roll_panel_content(state, roll_id),
-            view=RollView(),
+        await interaction.response.send_message(
+            "You currently have **2 or more weapon awards**. You must wait until Phase 2 "
+            "to roll on this item. Phase 2 only opens if nobody qualifies in Phase 1.",
+            ephemeral=True,
         )
-    except (discord.Forbidden, discord.HTTPException):
-        pass
+        return
+
+    # Phase 2 ignores total award count and checks boss + weapon type together.
+    if player_has_boss_weapon_type(guild_id, interaction.user.id, boss, weapon_type):
+        await interaction.response.send_message(
+            f"❌ You already have a **{canonical_boss_type(boss) or boss} {weapon_type}** award, "
+            "so this Phase 2 roll is declined.",
+            ephemeral=True,
+        )
+        return
+
+    await accept_roll(interaction, state, roll_id)
 
 
 async def handle_roll_info_button(interaction: discord.Interaction):
@@ -2127,8 +2436,49 @@ async def roll_checker():
         if state.get("closed"):
             continue
 
-        closes_at = str_to_dt(state.get("closes_at"))
+        mode = state.get("roll_mode", "fun")
 
+        if mode == "weapon":
+            phase = int(state.get("phase", 1))
+            phase1_ends = str_to_dt(state.get("phase1_ends_at"))
+            closes_at = str_to_dt(state.get("closes_at"))
+
+            # At hour 12: close if anyone qualified. Otherwise open Phase 2.
+            if phase == 1 and phase1_ends and now >= phase1_ends:
+                if state.get("rolls"):
+                    await close_roll_window(roll_id, announce=True)
+                    continue
+
+                state["phase"] = 2
+                state["phase2_started_at"] = dt_to_str(phase1_ends)
+                save_state()
+
+                channel_id = state.get("channel_id")
+                channel = bot.get_channel(channel_id) if channel_id else None
+                if channel is None and channel_id:
+                    try:
+                        channel = await bot.fetch_channel(channel_id)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        channel = None
+
+                if channel is not None:
+                    try:
+                        msg = await channel.fetch_message(roll_id)
+                        await msg.edit(content=build_roll_panel_content(state, roll_id), view=RollView())
+                        await channel.send(
+                            "⏰ **Phase 2 is now open.** Nobody qualified in Phase 1. "
+                            f"Players who do not already own a **{canonical_boss_type(str(state.get('boss', ''))) or state.get('boss', 'matching boss')} "
+                            f"{state.get('weapon_type', 'matching weapon')}** may roll until hour 24.",
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+            if closes_at and now >= closes_at:
+                await close_roll_window(roll_id, announce=True)
+            continue
+
+        closes_at = str_to_dt(state.get("closes_at"))
         if closes_at and now >= closes_at:
             await close_roll_window(roll_id, announce=True)
 
@@ -2185,66 +2535,171 @@ async def bidchat(
     await interaction.response.send_message(status)
 
 
-@bot.tree.command(name="roll", description="Open a roll panel")
+@bot.tree.command(name="roll", description="Open an official 2-phase weapon award roll")
 @app_commands.describe(
-    title="What this roll is for",
-    duration_hours="How long the roll stays open. Default is 24 hours.",
+    boss="Boss the weapon dropped from",
+    weapon_type="Weapon type being awarded",
+)
+@app_commands.choices(
+    boss=[app_commands.Choice(name=name, value=name) for name in ROLL_BOSSES],
+    weapon_type=[app_commands.Choice(name=name, value=name) for name in ROLL_WEAPON_TYPES],
 )
 async def roll(
     interaction: discord.Interaction,
-    title: str,
-    duration_hours: int = 24,
+    boss: app_commands.Choice[str],
+    weapon_type: app_commands.Choice[str],
 ):
     if not is_allowed_channel(interaction.channel):
-        await interaction.response.send_message(
-            "Use this in bid channels only.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
         return
-
     if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-        await interaction.response.send_message(
-            "Only leaders can open roll panels.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("Only leaders can open roll panels.", ephemeral=True)
         return
-
     channel = interaction.channel
-
     if channel is None:
-        await interaction.response.send_message(
-            "Channel not found.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
         return
 
-    title = title.strip()
-
-    if not title:
-        await interaction.response.send_message(
-            "Roll title cannot be blank.",
-            ephemeral=True,
-        )
-        return
-
-    if duration_hours <= 0:
-        await interaction.response.send_message(
-            "Duration must be at least 1 hour.",
-            ephemeral=True,
-        )
-        return
+    boss_name = boss.value
+    weapon_name = weapon_type.value
+    title = f"{boss_name} {weapon_name}"
+    now = utcnow()
 
     await interaction.response.send_message(
         f"🎲 **Roll Open — {title}**\nSetting up roll panel...",
         view=RollView(),
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
     sent = await interaction.original_response()
 
-    now = utcnow()
-
     roll_state[sent.id] = {
+        "roll_mode": "weapon",
+        "title": title,
+        "boss": boss_name,
+        "weapon_type": weapon_name,
+        "phase": 1,
+        "guild_id": interaction.guild.id,
+        "channel_id": channel.id,
+        "message_id": sent.id,
+        "created_by": interaction.user.id,
+        "created_at": dt_to_str(now),
+        "phase1_ends_at": dt_to_str(now + timedelta(hours=12)),
+        "closes_at": dt_to_str(now + timedelta(hours=24)),
+        "phase2_started_at": None,
+        "closed": False,
+        "closed_at": None,
+        "award_recorded": False,
+        "rolls": {},
+    }
+    save_state()
+    await sent.edit(content=build_roll_panel_content(roll_state[sent.id], sent.id), view=RollView())
+
+
+@bot.command(name="weaponcheck")
+async def weaponcheck(ctx: commands.Context, member: discord.Member | None = None):
+    """Leader-only audit showing exactly how active award names are classified."""
+    if ctx.guild is None or not is_leader(ctx.author, ctx.guild):
+        await ctx.reply("Only leaders can use `%weaponcheck`.", mention_author=False)
+        return
+
+    member = member or ctx.author
+    active_entries = [
+        entry
+        for entry in award_log
+        if int(entry.get("guild_id", 0)) == ctx.guild.id
+        and int(entry.get("winner_user_id", 0)) == member.id
+        and not award_is_returned(entry)
+    ]
+
+    recognized = []
+    unrecognized = []
+    for entry in active_entries:
+        boss_name = award_boss_type(entry)
+        weapon_name = award_weapon_type(entry)
+        if boss_name and weapon_name:
+            recognized.append((boss_name, weapon_name, entry))
+        elif boss_name or weapon_name:
+            unrecognized.append((boss_name, weapon_name, entry))
+
+    lines = [f"🔎 **Weapon Check — {discord.utils.escape_markdown(member.display_name)}**"]
+
+    if recognized:
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for boss_name, weapon_name, entry in recognized:
+            grouped.setdefault(boss_name, []).append((weapon_name, entry))
+
+        for boss_name in sorted(grouped):
+            lines.extend(["", f"**{boss_name}**"])
+            for weapon_name, entry in sorted(
+                grouped[boss_name],
+                key=lambda pair: (pair[0].casefold(), int(pair[1].get("log_id", 0) or 0)),
+            ):
+                item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+                log_id = entry.get("log_id", "?")
+                lines.append(f"• #{log_id} `{item}` → **{weapon_name}**")
+    else:
+        lines.extend(["", "No fully recognized active boss/weapon awards."])
+
+    if unrecognized:
+        lines.extend(["", "**Needs Review**"])
+        for boss_name, weapon_name, entry in unrecognized:
+            item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+            log_id = entry.get("log_id", "?")
+            boss_label = boss_name or "? boss"
+            weapon_label = weapon_name or "? weapon"
+            lines.append(f"• #{log_id} `{item}` → {boss_label} / {weapon_label}")
+
+    lines.extend([
+        "",
+        f"Recognized for eligibility: **{len(recognized)}**",
+        "Aliases: Dhio / Dino / Dhino / Voidsworn → **Dhiothu**",
+    ])
+
+    await ctx.reply(
+        "\n".join(lines),
+        mention_author=False,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="funroll", description="Open a simple unrestricted fun roll")
+@app_commands.describe(
+    title="What this fun roll is for",
+    duration_hours="How long the roll stays open. Default is 24 hours.",
+)
+async def funroll(
+    interaction: discord.Interaction,
+    title: str,
+    duration_hours: int = 24,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        return
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message("Only leaders can open roll panels.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    title = title.strip()
+    if not title:
+        await interaction.response.send_message("Roll title cannot be blank.", ephemeral=True)
+        return
+    if duration_hours <= 0:
+        await interaction.response.send_message("Duration must be at least 1 hour.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"🎲 **Fun Roll Open — {title}**\nSetting up roll panel...",
+        view=RollView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    sent = await interaction.original_response()
+    now = utcnow()
+    roll_state[sent.id] = {
+        "roll_mode": "fun",
         "title": title,
         "guild_id": interaction.guild.id,
         "channel_id": channel.id,
@@ -2257,13 +2712,9 @@ async def roll(
         "award_recorded": False,
         "rolls": {},
     }
-
     save_state()
+    await sent.edit(content=build_roll_panel_content(roll_state[sent.id], sent.id), view=RollView())
 
-    await sent.edit(
-        content=build_roll_panel_content(roll_state[sent.id], sent.id),
-        view=RollView(),
-    )
 
 @bot.tree.command(name="closeroll", description="Close a roll panel early")
 @app_commands.describe(
@@ -2472,6 +2923,9 @@ async def recordaward(
         "log_id": log_id,
         "roll_id": parsed_roll_id,
         "item": state.get("title", "Unknown item"),
+        "roll_mode": state.get("roll_mode", "fun"),
+        "boss": state.get("boss"),
+        "weapon_type": state.get("weapon_type"),
         "winner_user_id": winner_user_id,
         "winner_name_at_award": winner_name_at_award,
         "winner_name_when_rolled": selected_roll.get("display_name", "Unknown"),
