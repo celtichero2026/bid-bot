@@ -1,0 +1,4511 @@
+import os
+import json
+import traceback
+import random
+import secrets
+import re
+from datetime import datetime, timezone, timedelta
+
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+
+from asyncio import Lock
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+LEADER_ROLE_IDS = [
+    1415053351116079219,  # main server
+]
+
+ALLOWED_CHANNEL_IDS = [
+    1447764043090755646,  # Druid
+    1447764333894434837,  # Mage
+    1447764834132295782,  # Warrior
+    1447765010800578782,  # Rogue
+    1447765179172524184,  # Ranger
+    1447765439366168687,  # No Class Required
+    1527381268264653001,  # Roll Channel
+    1491844512828489918,  # TEST SERVER
+]
+
+OUTBID_INCREMENT = 0.10
+DATA_DIR = os.getenv("BIDBOT_DATA_DIR", "./data")
+DATA_FILE = os.path.join(DATA_DIR, "bid_state.json")
+FASHION_FILE = os.path.join(DATA_DIR, "fashion_state.json")
+
+# Dhiothu fashion tracker. This is stored separately from bid_state.json so the
+# fashion board cannot interfere with existing bids, rolls, or award history.
+DEFAULT_FASHION_STATE = {
+    "Axe": {"dropped": 5, "bank": 0},
+    "Sword": {"dropped": 5, "bank": 2},
+    "Wand": {"dropped": 2, "bank": 1},
+    "Grimoire": {"dropped": 4, "bank": 1},
+    "Knuckles": {"dropped": 7, "bank": 5},
+    "Bow": {"dropped": 4, "bank": 0},
+    "Hammer": {"dropped": 3, "bank": 0},
+    "Dagger": {"dropped": 5, "bank": 0},
+    "Totem": {"dropped": 1, "bank": 0},
+}
+fashion_state: dict[str, dict] = {}
+fashion_meta: dict = {}
+fashion_undo_state: dict | None = None
+
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.messages = True
+
+bot = commands.Bot(command_prefix="%", intents=intents)
+
+bid_state: dict[int, dict] = {}
+bid_locks: dict[int, Lock] = {}
+
+roll_state: dict[int, dict] = {}
+award_log: list[dict] = []
+roll_views_registered = False
+roll_locks: dict[int, Lock] = {}
+
+# Global switch for normal conversation inside bid threads.
+# True = chatter is blocked/warned (current behavior).
+# False = people can chat normally in bid threads.
+bid_chat_censorship_enabled = True
+
+
+def is_leader(
+    member: discord.Member | discord.User | None, guild: discord.Guild | None
+) -> bool:
+    if member is None or guild is None:
+        return False
+    if not isinstance(member, discord.Member):
+        return False
+    return any(role.id in LEADER_ROLE_IDS for role in member.roles)
+
+def parse_bid_numbers(value: str) -> list[int]:
+    """
+    Accepts formats such as:
+    1
+    1,2,3
+    1 2 3
+    1-4
+    1,3-5,8
+    """
+    numbers: set[int] = set()
+
+    cleaned = value.replace(" ", ",")
+
+    for part in cleaned.split(","):
+        part = part.strip()
+
+        if not part:
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+
+            if start <= 0 or end <= 0 or end < start:
+                raise ValueError("Invalid bid-number range.")
+
+            numbers.update(range(start, end + 1))
+        else:
+            number = int(part)
+
+            if number <= 0:
+                raise ValueError("Bid numbers must be greater than zero.")
+
+            numbers.add(number)
+
+    if not numbers:
+        raise ValueError("No bid numbers were provided.")
+
+    return sorted(numbers)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            f"Error: {type(error).__name__}: {error}", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Error: {type(error).__name__}: {error}", ephemeral=True
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def get_bid_lock(thread_id: int) -> Lock:
+    if thread_id not in bid_locks:
+        bid_locks[thread_id] = Lock()
+    return bid_locks[thread_id]
+
+
+def get_roll_lock(roll_id: int) -> Lock:
+    if roll_id not in roll_locks:
+        roll_locks[roll_id] = Lock()
+    return roll_locks[roll_id]
+
+
+def count_user_bids(state: dict, user_id: int) -> int:
+    return sum(
+        1
+        for entry in state.get("bid_log", [])
+        if entry.get("valid", False) and entry.get("bidder_id") == user_id
+    )
+
+
+def dt_to_str(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def str_to_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def shift_state_datetime(state: dict, key: str, duration: timedelta) -> None:
+    value = str_to_dt(state.get(key))
+
+    if value:
+        state[key] = dt_to_str(value + duration)
+
+
+def shift_bid_timers_after_pause(state: dict, duration: timedelta) -> None:
+    """
+    Moves timer-related timestamps forward so paused time does not count.
+    This also shifts bid_log timestamps so later recalculations do not undo the pause.
+    """
+    shift_state_datetime(state, "phase1_start", duration)
+    shift_state_datetime(state, "last_bid_time", duration)
+
+    last_valid = state.get("last_valid_bid")
+    if last_valid:
+        value = str_to_dt(last_valid.get("timestamp"))
+        if value:
+            last_valid["timestamp"] = dt_to_str(value + duration)
+
+    for entry in state.get("bid_log", []):
+        value = str_to_dt(entry.get("timestamp"))
+        if value:
+            entry["timestamp"] = dt_to_str(value + duration)
+
+
+def ensure_data_dir() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def is_allowed_channel(channel) -> bool:
+    if channel is None:
+        return False
+    if channel.id in ALLOWED_CHANNEL_IDS:
+        return True
+    if isinstance(channel, discord.Thread) and channel.parent_id in ALLOWED_CHANNEL_IDS:
+        return True
+    return False
+
+
+def min_outbid_from_min_bid(min_bid: int) -> int:
+    return max(10, int(min_bid * OUTBID_INCREMENT))
+
+
+def phase_label(phase: int) -> str:
+    return {
+        1: "Phase 1 — Open",
+        2: "Phase 2 — Restricted",
+        3: "Closed",
+    }.get(phase, "Unknown")
+
+
+def serialize_bid_state() -> dict:
+    payload = {}
+
+    for thread_id, state in bid_state.items():
+        copy_state = dict(state)
+        copy_state["phase1_bidders"] = list(state.get("phase1_bidders", set()))
+        copy_state["opted_out_bidders"] = list(state.get("opted_out_bidders", set()))
+        payload[str(thread_id)] = copy_state
+
+    return payload
+
+
+def deserialize_bid_state(raw: dict) -> dict[int, dict]:
+    restored = {}
+
+    for thread_id_str, state in raw.items():
+        restored[int(thread_id_str)] = {
+            **state,
+            "phase1_bidders": set(state.get("phase1_bidders", [])),
+            "opted_out_bidders": set(state.get("opted_out_bidders", [])),
+        }
+
+    return restored
+
+
+def serialize_roll_state() -> dict:
+    return {
+        str(roll_id): state
+        for roll_id, state in roll_state.items()
+    }
+
+
+def deserialize_roll_state(raw: dict) -> dict[int, dict]:
+    restored = {}
+
+    for roll_id_str, state in raw.items():
+        restored[int(roll_id_str)] = state
+
+    return restored
+
+
+def deserialize_award_log(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
+def serialize_state() -> dict:
+    return {
+        "version": 7,
+        "bid_state": serialize_bid_state(),
+        "roll_state": serialize_roll_state(),
+        "award_log": award_log,
+        "settings": {
+            "bid_chat_censorship_enabled": bid_chat_censorship_enabled,
+        },
+    }
+
+
+def save_state() -> None:
+    ensure_data_dir()
+
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(serialize_state(), f, indent=2)
+
+
+def load_state() -> None:
+    global bid_state, roll_state, award_log, bid_chat_censorship_enabled
+
+    ensure_data_dir()
+
+    if not os.path.exists(DATA_FILE):
+        bid_state = {}
+        roll_state = {}
+        award_log = []
+        bid_chat_censorship_enabled = True
+        return
+
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    # Combined state format. Missing award_log is treated as an empty log,
+    # so existing version 2 state files continue working without conversion.
+    if isinstance(raw, dict) and "bid_state" in raw:
+        bid_state = deserialize_bid_state(raw.get("bid_state", {}))
+        roll_state = deserialize_roll_state(raw.get("roll_state", {}))
+        award_log = deserialize_award_log(raw.get("award_log", []))
+
+        settings = raw.get("settings", {})
+        if isinstance(settings, dict):
+            bid_chat_censorship_enabled = bool(
+                settings.get("bid_chat_censorship_enabled", True)
+            )
+        else:
+            bid_chat_censorship_enabled = True
+        return
+
+    # Old format fallback — protects your original live bid_state.json.
+    bid_state = deserialize_bid_state(raw)
+    roll_state = {}
+    award_log = []
+    bid_chat_censorship_enabled = True
+
+
+def get_state(thread_id: int) -> dict | None:
+    return bid_state.get(thread_id)
+
+
+def get_roll_state(roll_id: int) -> dict | None:
+    return roll_state.get(roll_id)
+
+
+def get_state(thread_id: int) -> dict | None:
+    return bid_state.get(thread_id)
+
+
+def init_state(
+    thread_id: int,
+    toon: str,
+    amount: int,
+    min_bid: int,
+    bidder_id: int,
+    message_id: int | None,
+) -> dict:
+    now = utcnow()
+    outbid_inc = min_outbid_from_min_bid(min_bid)
+
+    state = {
+        "phase": 1,
+        "phase1_start": dt_to_str(now),
+        "last_bid_time": dt_to_str(now),
+        "phase1_bidders": {bidder_id},
+        "opted_out_bidders": set(),
+        "current_bid": amount,
+        "current_toon": toon,
+        "current_bidder_id": bidder_id,
+        "min_bid": min_bid,
+        "outbid_inc": outbid_inc,
+        "closed": False,
+        "paused": False,
+        "paused_at": None,
+        "pause_reason": None,
+        "paused_by": None,
+        "resumed_at": None,
+        "resumed_by": None,
+        "total_paused_seconds": 0,
+        "phase2_announced": False,
+        "closed_announced": False,
+        "last_valid_bid": {
+            "toon": toon,
+            "amount": amount,
+            "bidder_id": bidder_id,
+            "message_id": message_id,
+            "timestamp": dt_to_str(now),
+        },
+        "bid_log": [
+            {
+                "bid_number": 1,
+                "toon": toon,
+                "amount": amount,
+                "bidder_id": bidder_id,
+                "message_id": message_id,
+                "timestamp": dt_to_str(now),
+                "valid": True,
+                "reason": None,
+            }
+        ],
+    }
+
+    bid_state[thread_id] = state
+    return state
+
+
+def recalc_last_valid_bid(state: dict) -> None:
+    for entry in reversed(state["bid_log"]):
+        if entry.get("valid"):
+            state["last_valid_bid"] = {
+                "toon": entry["toon"],
+                "amount": entry["amount"],
+                "bidder_id": entry["bidder_id"],
+                "message_id": entry.get("message_id"),
+                "timestamp": entry["timestamp"],
+            }
+            state["current_toon"] = entry["toon"]
+            state["current_bid"] = entry["amount"]
+            state["current_bidder_id"] = entry["bidder_id"]
+            state["last_bid_time"] = entry["timestamp"]
+            return
+
+    state["last_valid_bid"] = None
+    state["current_toon"] = ""
+    state["current_bid"] = 0
+    state["current_bidder_id"] = 0
+
+
+def recalc_phase1_bidders(state: dict) -> None:
+    phase1_start = str_to_dt(state.get("phase1_start"))
+
+    if not phase1_start:
+        state["phase1_bidders"] = set()
+        return
+
+    cutoff = phase1_start + timedelta(hours=24)
+
+    valid_bidders = set()
+
+    for entry in state.get("bid_log", []):
+        if not entry.get("valid"):
+            continue
+
+        ts = str_to_dt(entry.get("timestamp"))
+        if not ts:
+            continue
+
+        if ts <= cutoff:
+            valid_bidders.add(entry["bidder_id"])
+
+    state["phase1_bidders"] = valid_bidders
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dhio fashion tracker
+# ──────────────────────────────────────────────────────────────────────────────
+
+FASHION_EMOJIS = {
+    "Axe": "🪓",
+    "Sword": "⚔️",
+    "Wand": "🪄",
+    "Grimoire": "📖",
+    "Knuckles": "🥊",
+    "Bow": "🏹",
+    "Hammer": "🔨",
+    "Dagger": "🗡️",
+    "Totem": "🪶",
+}
+
+# Structured weapon-roll options. Add future cosmetic-dropping bosses here.
+# Historical names/abbreviations are normalized through ROLL_BOSS_ALIASES below.
+ROLL_BOSSES = [
+    "Dhiothu",
+]
+
+ROLL_BOSS_ALIASES = {
+    "dhiothu": "Dhiothu",
+    "dhio": "Dhiothu",
+    "dino": "Dhiothu",
+    "dhino": "Dhiothu",
+    "voidsworn": "Dhiothu",
+}
+
+ROLL_WEAPON_TYPES = [
+    "Bow",
+    "Knuckles",
+    "Dagger",
+    "Axe",
+    "Sword",
+    "Totem",
+    "Grimoire",
+    "Wand",
+    "Hammer",
+]
+
+ROLL_WEAPON_ALIASES = {
+    "bow": "Bow",
+    "knuckles": "Knuckles",
+    "knucks": "Knuckles",
+    "knuck": "Knuckles",
+    "dagger": "Dagger",
+    "axe": "Axe",
+    "sword": "Sword",
+    "totem": "Totem",
+    "grimoire": "Grimoire",
+    "grim": "Grimoire",
+    "grimorie": "Grimoire",
+    "wand": "Wand",
+    "hammer": "Hammer",
+}
+
+
+def load_fashion_state() -> None:
+    """Load the tracker and migrate the old holders-based file automatically."""
+    global fashion_state, fashion_meta, fashion_undo_state
+    ensure_data_dir()
+
+    if not os.path.exists(FASHION_FILE):
+        fashion_state = json.loads(json.dumps(DEFAULT_FASHION_STATE))
+        fashion_meta = {}
+        fashion_undo_state = None
+        save_fashion_state()
+        return
+
+    try:
+        with open(FASHION_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+
+    # New format stores the board plus small audit/undo metadata. Old files had
+    # weapon names directly at the top level; both formats are accepted.
+    if isinstance(raw, dict) and isinstance(raw.get("weapons"), dict):
+        raw_weapons = raw.get("weapons", {})
+        raw_meta = raw.get("meta", {})
+        raw_undo = raw.get("undo")
+    else:
+        raw_weapons = raw if isinstance(raw, dict) else {}
+        raw_meta = {}
+        raw_undo = None
+
+    fashion_state = {}
+    for weapon, default in DEFAULT_FASHION_STATE.items():
+        saved = raw_weapons.get(weapon, {}) if isinstance(raw_weapons, dict) else {}
+        fashion_state[weapon] = {
+            "dropped": int(saved.get("dropped", default["dropped"])),
+            "bank": int(saved.get("bank", default["bank"])),
+        }
+
+    fashion_meta = raw_meta if isinstance(raw_meta, dict) else {}
+
+    if isinstance(raw_undo, dict) and isinstance(raw_undo.get("weapons"), dict):
+        undo_weapons = {}
+        for weapon, default in DEFAULT_FASHION_STATE.items():
+            saved = raw_undo["weapons"].get(weapon, {})
+            undo_weapons[weapon] = {
+                "dropped": int(saved.get("dropped", default["dropped"])),
+                "bank": int(saved.get("bank", default["bank"])),
+            }
+        fashion_undo_state = {
+            "weapons": undo_weapons,
+            "meta": raw_undo.get("meta", {}) if isinstance(raw_undo.get("meta"), dict) else {},
+        }
+    else:
+        fashion_undo_state = None
+
+
+def save_fashion_state() -> None:
+    ensure_data_dir()
+    payload = {
+        "version": 2,
+        "weapons": fashion_state,
+        "meta": fashion_meta,
+        "undo": fashion_undo_state,
+    }
+    with open(FASHION_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def fashion_snapshot() -> dict:
+    return {
+        "weapons": json.loads(json.dumps(fashion_state)),
+        "meta": json.loads(json.dumps(fashion_meta)),
+    }
+
+
+def set_fashion_updated_by(user: discord.Member | discord.User) -> None:
+    fashion_meta["last_updated_by_id"] = int(user.id)
+    fashion_meta["last_updated_by_name"] = (
+        getattr(user, "display_name", None)
+        or getattr(user, "name", "Unknown")
+    )
+    fashion_meta["last_updated_at"] = dt_to_str(utcnow())
+
+
+def build_fashion_embed() -> discord.Embed:
+    total_dropped = sum(int(v.get("dropped", 0)) for v in fashion_state.values())
+    total_bank = sum(int(v.get("bank", 0)) for v in fashion_state.values())
+
+    embed = discord.Embed(
+        title="✨ Dhiothu Fashion Weapon Tracker",
+        description=f"**Total dropped:** {total_dropped}  •  **In bank:** {total_bank}",
+    )
+
+    for weapon in DEFAULT_FASHION_STATE:
+        data = fashion_state.get(weapon, DEFAULT_FASHION_STATE[weapon])
+        embed.add_field(
+            name=f"{FASHION_EMOJIS.get(weapon, '•')} {weapon}",
+            value=(
+                f"**Dropped:** {int(data.get('dropped', 0))}  •  "
+                f"**Bank:** {int(data.get('bank', 0))}"
+            ),
+            inline=False,
+        )
+
+    updated_at = str_to_dt(fashion_meta.get("last_updated_at"))
+    updated_name = str(fashion_meta.get("last_updated_by_name", "")).strip()
+    if updated_at and updated_name:
+        # Discord renders embed timestamps in each viewer's local timezone.
+        embed.set_footer(text=f"Last updated by {updated_name}")
+        embed.timestamp = updated_at
+    else:
+        embed.set_footer(text="Last updated: not yet recorded")
+
+    return embed
+
+
+class FashionEditModal(discord.ui.Modal):
+    def __init__(self, weapon: str):
+        super().__init__(title=f"Edit {weapon}")
+        self.weapon = weapon
+        data = fashion_state.get(weapon, DEFAULT_FASHION_STATE[weapon])
+
+        self.dropped = discord.ui.TextInput(
+            label="Total dropped",
+            default=str(data.get("dropped", 0)),
+            required=True,
+            max_length=4,
+        )
+        self.bank = discord.ui.TextInput(
+            label="Currently in bank",
+            default=str(data.get("bank", 0)),
+            required=True,
+            max_length=4,
+        )
+        self.add_item(self.dropped)
+        self.add_item(self.bank)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        global fashion_undo_state
+
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can edit the fashion tracker.", ephemeral=True
+            )
+            return
+
+        try:
+            dropped = int(str(self.dropped.value).strip())
+            bank = int(str(self.bank.value).strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Dropped and Bank must both be whole numbers.", ephemeral=True
+            )
+            return
+
+        if dropped < 0 or bank < 0:
+            await interaction.response.send_message(
+                "Dropped and Bank cannot be negative.", ephemeral=True
+            )
+            return
+
+        if bank > dropped:
+            await interaction.response.send_message(
+                "Bank cannot be greater than the total number dropped.", ephemeral=True
+            )
+            return
+
+        current = fashion_state.get(self.weapon, DEFAULT_FASHION_STATE[self.weapon])
+        if int(current.get("dropped", 0)) == dropped and int(current.get("bank", 0)) == bank:
+            await interaction.response.send_message(
+                "No changes were made.", ephemeral=True
+            )
+            return
+
+        # One-level safety net: every real edit replaces the previous undo snapshot.
+        fashion_undo_state = fashion_snapshot()
+        fashion_state[self.weapon] = {
+            "dropped": dropped,
+            "bank": bank,
+        }
+        set_fashion_updated_by(interaction.user)
+        save_fashion_state()
+
+        await interaction.response.edit_message(
+            embed=build_fashion_embed(),
+            view=FashionTrackerView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class FashionWeaponButton(discord.ui.Button):
+    def __init__(self, weapon: str, row: int):
+        super().__init__(
+            label=weapon,
+            emoji=FASHION_EMOJIS.get(weapon),
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"bidbot_fashion_{weapon.lower()}",
+            row=row,
+        )
+        self.weapon = weapon
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can edit the fashion tracker.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(FashionEditModal(self.weapon))
+
+
+class FashionTrackerView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        weapons = list(DEFAULT_FASHION_STATE.keys())
+        for index, weapon in enumerate(weapons):
+            # Five buttons max per Discord action row.
+            self.add_item(FashionWeaponButton(weapon, row=0 if index < 5 else 1))
+
+        undo_button = discord.ui.Button(
+            label="Undo Last Update",
+            emoji="↩️",
+            style=discord.ButtonStyle.danger,
+            custom_id="bidbot_fashion_undo",
+            row=2,
+        )
+        undo_button.callback = self.undo_last_update
+        self.add_item(undo_button)
+
+    async def undo_last_update(self, interaction: discord.Interaction):
+        global fashion_state, fashion_meta, fashion_undo_state
+
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can undo fashion tracker updates.", ephemeral=True
+            )
+            return
+
+        if not fashion_undo_state:
+            await interaction.response.send_message(
+                "There is no fashion board update to undo.", ephemeral=True
+            )
+            return
+
+        previous = fashion_undo_state
+        fashion_state = json.loads(json.dumps(previous.get("weapons", DEFAULT_FASHION_STATE)))
+        # The undo itself becomes the newest board update for the audit footer.
+        fashion_meta = previous.get("meta", {}) if isinstance(previous.get("meta"), dict) else {}
+        set_fashion_updated_by(interaction.user)
+        fashion_undo_state = None
+        save_fashion_state()
+
+        await interaction.response.edit_message(
+            embed=build_fashion_embed(),
+            view=FashionTrackerView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+
+async def slash_send(interaction: discord.Interaction, *args, **kwargs):
+    """Send a slash-command response and return the created message when possible."""
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, wait=True, **kwargs)
+
+    await interaction.response.send_message(*args, **kwargs)
+    try:
+        return await interaction.original_response()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Roll helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def canonical_boss_type(value: str | None) -> str | None:
+    """Normalize current and historical names for a cosmetic-dropping boss."""
+    text = (value or "").strip().casefold()
+    if not text:
+        return None
+    return ROLL_BOSS_ALIASES.get(text)
+
+
+def canonical_weapon_type(value: str | None) -> str | None:
+    text = (value or "").strip().casefold()
+    if not text:
+        return None
+    return ROLL_WEAPON_ALIASES.get(text)
+
+
+def award_boss_type(entry: dict) -> str | None:
+    """Return the structured/recognizable boss for a roll award.
+
+    New awards use the saved boss field. Older awards are inferred from the
+    historical item title (Dhio/Dino/Dhino/Voidsworn -> Dhiothu).
+    """
+    structured = canonical_boss_type(str(entry.get("boss", "")))
+    if structured:
+        return structured
+
+    item_text = str(entry.get("item", "")).casefold()
+    for alias, canonical in ROLL_BOSS_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", item_text):
+            return canonical
+    return None
+
+
+def award_weapon_type(entry: dict) -> str | None:
+    """Return the structured/recognizable weapon type for a roll award."""
+    structured = canonical_weapon_type(str(entry.get("weapon_type", "")))
+    if structured:
+        return structured
+
+    normalized = normalize_item_name(str(entry.get("item", "")))
+    for alias, canonical in ROLL_WEAPON_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", normalized):
+            return canonical
+    return None
+
+
+def get_player_weapon_awards(
+    guild_id: int,
+    user_id: int,
+    boss: str | None = None,
+) -> list[dict]:
+    """Current recognized weapon awards, optionally limited to one boss set."""
+    wanted_boss = canonical_boss_type(boss) if boss else None
+    entries = [
+        entry
+        for entry in award_log
+        if int(entry.get("guild_id", 0)) == guild_id
+        and int(entry.get("winner_user_id", 0)) == user_id
+        and not award_is_returned(entry)
+        and not award_is_voided(entry)
+        and award_weapon_type(entry) is not None
+    ]
+    if wanted_boss is not None:
+        entries = [entry for entry in entries if award_boss_type(entry) == wanted_boss]
+    return entries
+
+
+def player_has_boss_weapon_type(
+    guild_id: int,
+    user_id: int,
+    boss: str,
+    weapon_type: str,
+) -> bool:
+    """True when the player currently owns this weapon from this boss set."""
+    wanted_boss = canonical_boss_type(boss)
+    wanted_weapon = canonical_weapon_type(weapon_type)
+    if not wanted_boss or not wanted_weapon:
+        return False
+    return any(
+        award_boss_type(entry) == wanted_boss
+        and award_weapon_type(entry) == wanted_weapon
+        for entry in get_player_weapon_awards(guild_id, user_id, boss=wanted_boss)
+    )
+
+
+def next_unique_roll_value(state: dict) -> int | None:
+    """Return an unused 0-100 value for this roll panel, or None if exhausted."""
+    used = {
+        int(entry.get("roll"))
+        for entry in state.get("rolls", {}).values()
+        if isinstance(entry.get("roll"), int) and 0 <= int(entry.get("roll")) <= 100
+    }
+    available = [value for value in range(101) if value not in used]
+    if not available:
+        return None
+    return secrets.choice(available)
+
+
+async def accept_roll(interaction: discord.Interaction, state: dict, roll_id: int) -> None:
+    """Record one unique 0-100 roll and refresh the open roll panel."""
+    user_id = str(interaction.user.id)
+    rolls = state.setdefault("rolls", {})
+
+    if user_id in rolls:
+        existing = rolls[user_id]
+        await interaction.response.send_message(
+            f"❌ You already rolled for **{state.get('title', 'this roll')}**.\n"
+            f"Your roll: **{existing.get('roll')}**",
+            ephemeral=True,
+        )
+        return
+
+    roll_value = next_unique_roll_value(state)
+    if roll_value is None:
+        await interaction.response.send_message(
+            "This roll has used every number from 0–100.",
+            ephemeral=True,
+        )
+        return
+
+    display_name = (
+        getattr(interaction.user, "display_name", None)
+        or getattr(interaction.user, "name", "Unknown")
+    )
+
+    rolls[user_id] = {
+        "user_id": interaction.user.id,
+        "display_name": display_name,
+        "roll": roll_value,
+        "timestamp": dt_to_str(utcnow()),
+    }
+    save_state()
+
+    await interaction.response.send_message(
+        f"🎲 **{display_name}** rolled **{roll_value}** for **{state.get('title', 'Roll')}**.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    if interaction.message is not None:
+        try:
+            await interaction.message.edit(
+                content=build_roll_panel_content(state, roll_id),
+                embed=None,
+                view=RollView(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+def display_time_left(closes_at_text: str | None) -> str:
+    closes_at = str_to_dt(closes_at_text)
+
+    if not closes_at:
+        return "Unknown"
+
+    delta = closes_at - utcnow()
+    total = max(int(delta.total_seconds()), 0)
+
+    hours, remainder = divmod(total, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    return f"{hours}h {minutes}m"
+
+
+def get_sorted_rolls(state: dict) -> list[dict]:
+    rolls = list(state.get("rolls", {}).values())
+
+    return sorted(
+        rolls,
+        key=lambda item: (
+            -int(item.get("roll", -1)),
+            item.get("timestamp", ""),
+        ),
+    )
+
+
+def next_award_log_id() -> int:
+    return max(
+        (int(entry.get("log_id", 0)) for entry in award_log),
+        default=0,
+    ) + 1
+
+
+def get_award_for_roll(roll_id: int) -> dict | None:
+    """Return the current non-voided award record for a roll, if one exists."""
+    matches = [
+        entry for entry in award_log
+        if int(entry.get("roll_id", 0)) == roll_id and not award_is_voided(entry)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda entry: int(entry.get("log_id", 0) or 0))
+
+def get_roll_for_channel(
+    channel_id: int,
+    guild_id: int | None = None,
+) -> tuple[int, dict] | None:
+    """Return the newest unrecorded roll created in a channel/thread.
+
+    If every matching roll has already been recorded, the newest matching roll
+    is returned so the normal duplicate-award message can be shown.
+    """
+    matching: list[tuple[int, dict]] = []
+
+    for roll_id, state in roll_state.items():
+        if int(state.get("channel_id", 0)) != channel_id:
+            continue
+
+        state_guild_id = state.get("guild_id")
+        if (
+            guild_id is not None
+            and state_guild_id is not None
+            and int(state_guild_id) != guild_id
+        ):
+            continue
+
+        matching.append((roll_id, state))
+
+    if not matching:
+        return None
+
+    unrecorded = [
+        (roll_id, state)
+        for roll_id, state in matching
+        if not state.get("award_recorded")
+        and get_award_for_roll(roll_id) is None
+    ]
+
+    candidates = unrecorded or matching
+
+    return max(
+        candidates,
+        key=lambda pair: (
+            pair[1].get("created_at", ""),
+            pair[0],
+        ),
+    )
+
+
+def award_is_returned(entry: dict) -> bool:
+    """Return True when an award was legitimately returned to the clan."""
+    return bool(entry.get("returned")) or bool(entry.get("returned_at"))
+
+
+def award_is_voided(entry: dict) -> bool:
+    """Return True when an award record was undone because it was entered incorrectly."""
+    return bool(entry.get("voided")) or bool(entry.get("voided_at"))
+
+
+def award_is_current(entry: dict) -> bool:
+    return not award_is_returned(entry) and not award_is_voided(entry)
+
+ITEM_NAME_ALIASES = {
+    "knucks": "knuckles",
+    "knuck": "knuckles",
+    "grim": "grimoire",
+    "grimorie": "grimoire",
+}
+
+
+def normalize_item_name(value: str | None) -> str:
+    """Normalize common fashion-name shorthand for searching/matching.
+
+    This does not rewrite the saved/displayed roll title; it only makes aliases
+    such as knucks/knuckles and grim/grimoire match each other.
+    """
+    text = (value or "").strip().casefold()
+    if not text:
+        return ""
+
+    # Replace whole words only so unrelated words are never altered.
+    for alias, canonical in ITEM_NAME_ALIASES.items():
+        text = re.sub(rf"\b{re.escape(alias)}\b", canonical, text)
+
+    return " ".join(text.split())
+
+
+def get_filtered_roll_awards(
+    guild_id: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+    include_returned: bool = False,
+) -> list[dict]:
+    """Filter current ownership or permanent history."""
+    normalized_item = normalize_item_name(item_query)
+    entries = []
+
+    for entry in award_log:
+        if int(entry.get("guild_id", 0)) != guild_id:
+            continue
+        if not include_returned and not award_is_current(entry):
+            continue
+        if member_id is not None and int(entry.get("winner_user_id", 0)) != member_id:
+            continue
+        item_name = str(entry.get("item", ""))
+        if normalized_item and normalized_item not in normalize_item_name(item_name):
+            continue
+        entries.append(entry)
+
+    if include_returned:
+        return sorted(
+            entries,
+            key=lambda entry: (
+                entry.get("awarded_at", ""),
+                int(entry.get("log_id", 0)),
+            ),
+            reverse=True,
+        )
+
+    return sorted(
+        entries,
+        key=lambda entry: (
+            str(entry.get("item", "")).casefold(),
+            str(entry.get("winner_name_at_award", "")).casefold(),
+            int(entry.get("log_id", 0)),
+        ),
+    )
+
+def get_active_award_for_channel(channel_id: int, guild_id: int) -> dict | None:
+    """Return the newest current award associated with a channel/thread."""
+    matches = [
+        entry
+        for entry in award_log
+        if int(entry.get("guild_id", 0)) == guild_id
+        and int(entry.get("channel_id", 0) or 0) == channel_id
+        and award_is_current(entry)
+    ]
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda entry: (entry.get("awarded_at", ""), int(entry.get("log_id", 0))),
+    )
+
+
+def get_active_award_by_log_id(guild_id: int, log_id: int) -> dict | None:
+    for entry in award_log:
+        if int(entry.get("guild_id", 0)) != guild_id:
+            continue
+        if int(entry.get("log_id", 0)) != log_id:
+            continue
+        if not award_is_current(entry):
+            return None
+        return entry
+    return None
+
+
+def get_award_by_message_id(message_id: int) -> dict | None:
+    matches = [
+        entry for entry in award_log
+        if int(entry.get("award_message_id", 0) or 0) == message_id
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda entry: int(entry.get("log_id", 0) or 0))
+
+def format_award_timestamp(value: str | None) -> str:
+    awarded_at = str_to_dt(value)
+    if awarded_at is None:
+        return "Unknown date"
+    return f"<t:{int(awarded_at.timestamp())}:f>"
+
+
+def build_roll_awards_content(
+    entries: list[dict],
+    page: int,
+    per_page: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+) -> str:
+    """Build the clean current-ownership view used by /rollawards."""
+    total = len(entries)
+    total_pages = max((total + per_page - 1) // per_page, 1)
+    page = min(max(page, 0), total_pages - 1)
+
+    if member_id is not None:
+        lines = [f"🏆 **Roll Awards — <@{member_id}>**"]
+    else:
+        lines = ["🏆 **Roll Awards — Current Items**"]
+
+    if item_query:
+        lines.append(
+            f"Item contains: **{discord.utils.escape_markdown(item_query)}**"
+        )
+
+    lines.append(f"Current items: **{total}** • Page **{page + 1}/{total_pages}**")
+
+    if not entries:
+        lines.extend(["", "No current items matched those filters."])
+        return "\n".join(lines)
+
+    start = page * per_page
+    page_entries = entries[start:start + per_page]
+    lines.append("")
+
+    for entry in page_entries:
+        item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+        winner_id = int(entry.get("winner_user_id", 0))
+
+        if member_id is not None:
+            lines.append(f"• **{item}**")
+        else:
+            lines.append(f"• **{item}** — <@{winner_id}>")
+
+    return "\n".join(lines)
+
+
+def build_roll_audit_content(
+    entries: list[dict],
+    page: int,
+    per_page: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+) -> str:
+    total = len(entries)
+    total_pages = max((total + per_page - 1) // per_page, 1)
+    page = min(max(page, 0), total_pages - 1)
+    lines = ["📋 **Fashion History**"]
+    if member_id is not None:
+        lines[0] += f" — <@{member_id}>"
+    if item_query:
+        lines.append(f"Filter: **{discord.utils.escape_markdown(item_query)}**")
+    if not entries:
+        lines.append("No history matched those filters.")
+        return "\n".join(lines)
+
+    start = page * per_page
+    for entry in entries[start:start + per_page]:
+        if award_is_voided(entry):
+            icon, suffix = "❌", " — Voided"
+        elif award_is_returned(entry):
+            icon, suffix = "↩️", " — Returned"
+        else:
+            icon, suffix = "✅", ""
+        item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+        roll_value = entry.get("winning_roll")
+        roll_text = f" • Roll {roll_value}" if roll_value is not None else ""
+        if member_id is None:
+            lines.append(
+                f"{icon} **#{entry.get('log_id', '?')} {item}** — <@{int(entry.get('winner_user_id', 0))}>{roll_text}{suffix}"
+            )
+        else:
+            lines.append(f"{icon} **#{entry.get('log_id', '?')} {item}**{roll_text}{suffix}")
+    lines.append(f"Page {page + 1}/{total_pages}")
+    return "\n".join(lines)
+
+def build_roll_awards_embed(
+    entries: list[dict],
+    page: int,
+    per_page: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+    highlight_log_id: int | None = None,
+) -> discord.Embed:
+    """Build the clean current-ownership embed used by /rollawards.
+
+    List numbers are stable within the current filtered result set so leaders can
+    use the Return Item button and enter the visible list number.
+    """
+    total = len(entries)
+    total_pages = max((total + per_page - 1) // per_page, 1)
+    page = min(max(page, 0), total_pages - 1)
+
+    title = "🏆 Roll Awards"
+    if highlight_log_id is not None:
+        title = "🏆 Award Recorded — Player Items"
+    elif member_id is not None:
+        title += " — Player Items"
+    else:
+        title += " — Current Items"
+
+    embed = discord.Embed(title=title)
+
+    header_parts = []
+    highlighted = None
+    if highlight_log_id is not None:
+        highlighted = next(
+            (entry for entry in entries if int(entry.get("log_id", 0) or 0) == highlight_log_id),
+            None,
+        )
+        if highlighted is not None:
+            item = discord.utils.escape_markdown(str(highlighted.get("item", "Unknown item")))
+            roll_value = highlighted.get("winning_roll")
+            if roll_value is None:
+                roll_value = "N/A"
+            method = highlighted.get("selection_method", "highest_roll")
+            method_label = (
+                "manual award — did not roll"
+                if method == "manual_no_roll"
+                else "manual selection"
+                if method == "manual"
+                else "highest roller"
+            )
+            header_parts.append(
+                f"**Just awarded:** {item} • Roll **{roll_value}** ({method_label})"
+            )
+    if member_id is not None:
+        header_parts.append(f"**Player:** <@{member_id}>")
+    if item_query:
+        header_parts.append(
+            f"**Filter:** {discord.utils.escape_markdown(item_query)}"
+        )
+
+    if header_parts:
+        embed.description = "\n".join(header_parts)
+
+    if not entries:
+        embed.add_field(
+            name="No current items",
+            value="No current items matched those filters.",
+            inline=False,
+        )
+    else:
+        start = page * per_page
+        page_entries = entries[start:start + per_page]
+
+        lines = []
+        for offset, entry in enumerate(page_entries, start=start + 1):
+            item = discord.utils.escape_markdown(
+                str(entry.get("item", "Unknown item"))
+            )
+            winner_id = int(entry.get("winner_user_id", 0))
+
+            is_new = (
+                highlight_log_id is not None
+                and int(entry.get("log_id", 0) or 0) == highlight_log_id
+            )
+            new_marker = " **← NEW**" if is_new else ""
+
+            if member_id is not None:
+                lines.append(f"**{offset}.** {item}{new_marker}")
+            else:
+                lines.append(f"**{offset}.** {item} — <@{winner_id}>{new_marker}")
+
+        embed.add_field(
+            name=f"Items ({total})",
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    footer = f"{total} current items • Page {page + 1}/{total_pages}"
+    if member_id is not None and entries:
+        footer += " • Leaders: Refund / Return Item → enter list #"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def build_roll_audit_embed(
+    entries: list[dict],
+    page: int,
+    per_page: int,
+    member_id: int | None = None,
+    item_query: str | None = None,
+) -> discord.Embed:
+    """Compact permanent fashion history."""
+    total = len(entries)
+    total_pages = max((total + per_page - 1) // per_page, 1)
+    page = min(max(page, 0), total_pages - 1)
+
+    title = "📋 Fashion History"
+    if member_id is not None:
+        title += " — Player"
+    embed = discord.Embed(title=title)
+
+    description = []
+    if member_id is not None:
+        description.append(f"<@{member_id}>")
+    if item_query:
+        description.append(f"Filter: **{discord.utils.escape_markdown(item_query)}**")
+    if description:
+        embed.description = "\n".join(description)
+
+    start = page * per_page
+    page_entries = entries[start:start + per_page]
+    if not page_entries:
+        embed.add_field(name="History", value="No history matched those filters.", inline=False)
+    else:
+        lines = []
+        for entry in page_entries:
+            if award_is_voided(entry):
+                icon, suffix = "❌", " • Voided"
+            elif award_is_returned(entry):
+                icon, suffix = "↩️", " • Returned"
+            else:
+                icon, suffix = "✅", ""
+            item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+            roll_value = entry.get("winning_roll")
+            roll_text = f" • {roll_value}" if roll_value is not None else ""
+            if member_id is None:
+                holder = f" • <@{int(entry.get('winner_user_id', 0))}>"
+            else:
+                holder = ""
+            lines.append(
+                f"{icon} **#{entry.get('log_id', '?')} {item}**{holder}{roll_text}{suffix}"
+            )
+        embed.add_field(name=f"Entries ({total})", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text=f"Page {page + 1}/{total_pages}")
+    return embed
+
+def build_roll_panel_content(state: dict, roll_id: int) -> str:
+    title = state.get("title", "Roll")
+    rolls = state.get("rolls", {})
+    mode = state.get("roll_mode", "fun")
+    closes_at = str_to_dt(state.get("closes_at"))
+
+    if state.get("closed"):
+        return f"🏁 **{title} — Closed**"
+
+    lines = [
+        f"🎲 **{title}**",
+        f"Roll ID: `{roll_id}`",
+    ]
+    if closes_at:
+        lines.append(f"Closes <t:{int(closes_at.timestamp())}:R>")
+    lines.extend([
+        "",
+        "Click **Roll** to roll 0–100.",
+        "• One roll per player",
+        "• Roll numbers are unique — no ties",
+        f"• Rolls: **{len(rolls)}**",
+    ])
+    if mode == "fun":
+        lines.append("• Highest roll wins")
+    return "\n".join(lines)
+
+
+def get_roll_candidate_rows(state: dict) -> list[dict]:
+    """Current roll rows with live inventory information for manager review."""
+    rows = []
+    guild_id = int(state.get("guild_id", 0) or 0)
+    boss = str(state.get("boss", ""))
+    weapon = str(state.get("weapon_type", ""))
+    is_weapon = state.get("roll_mode") == "weapon"
+
+    for roll in get_sorted_rolls(state):
+        user_id = int(roll.get("user_id", 0) or 0)
+        count = None
+        owns_weapon = False
+        if is_weapon:
+            count = len(get_player_weapon_awards(guild_id, user_id, boss=boss))
+            owns_weapon = player_has_boss_weapon_type(guild_id, user_id, boss, weapon)
+        rows.append({
+            **roll,
+            "fashion_count": count,
+            "owns_weapon": owns_weapon,
+        })
+    return rows
+
+
+def get_award_selection_rows(state: dict) -> list[dict]:
+    """Priority (0 fashion) first, then everyone else; each group highest roll first."""
+    rows = get_roll_candidate_rows(state)
+    if state.get("roll_mode") != "weapon":
+        return rows
+    return sorted(
+        rows,
+        key=lambda row: (
+            0 if int(row.get("fashion_count", 0) or 0) == 0 else 1,
+            -int(row.get("roll", -1)),
+            row.get("timestamp", ""),
+        ),
+    )
+
+
+def _add_embed_line_fields(embed: discord.Embed, name: str, lines: list[str]) -> None:
+    if not lines:
+        embed.add_field(name=name, value="None", inline=False)
+        return
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        extra = len(line) + 1
+        if current and current_len + extra > 950:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += extra
+    if current:
+        chunks.append(current)
+    for index, chunk in enumerate(chunks):
+        field_name = name if index == 0 else f"{name} (cont.)"
+        embed.add_field(name=field_name, value="\n".join(chunk), inline=False)
+
+
+def build_closed_roll_embed(state: dict, roll_id: int) -> discord.Embed:
+    title = state.get("title", "Roll")
+    rows = get_roll_candidate_rows(state)
+    embed = discord.Embed(title=f"🏁 {title} — Closed")
+
+    refreshed = str_to_dt(state.get("inventory_refreshed_at"))
+    desc = [f"**{len(rows)} rollers**"]
+    if refreshed and state.get("roll_mode") == "weapon":
+        desc.append(f"Inventory refreshed <t:{int(refreshed.timestamp())}:R>")
+    embed.description = " • ".join(desc)
+
+    if not rows:
+        embed.add_field(name="Rolls", value="No rolls recorded.", inline=False)
+        return embed
+
+    if state.get("roll_mode") == "weapon":
+        priority_rows = [row for row in rows if int(row.get("fashion_count", 0) or 0) == 0]
+        priority_lines = [
+            f"⭐ **{discord.utils.escape_markdown(str(row.get('display_name', 'Unknown')))}** — {row.get('roll')}"
+            for row in priority_rows
+        ]
+        _add_embed_line_fields(embed, "⭐ 0 Fashions", priority_lines)
+
+        top_lines = []
+        weapon = str(state.get("weapon_type", "weapon"))
+        for index, row in enumerate(rows[:20], start=1):
+            name = discord.utils.escape_markdown(str(row.get("display_name", "Unknown")))
+            count = int(row.get("fashion_count", 0) or 0)
+            warning = f" • ⚠️ owns {weapon}" if row.get("owns_weapon") else ""
+            top_lines.append(
+                f"**{index}.** {name} — {row.get('roll')} • {count} fashion{'s' if count != 1 else ''}{warning}"
+            )
+        _add_embed_line_fields(embed, "🎲 Top 20", top_lines)
+    else:
+        top_lines = [
+            f"**{index}.** {discord.utils.escape_markdown(str(row.get('display_name', 'Unknown')))} — {row.get('roll')}"
+            for index, row in enumerate(rows[:20], start=1)
+        ]
+        _add_embed_line_fields(embed, "🎲 Top 20", top_lines)
+
+    embed.set_footer(text=f"Roll ID: {roll_id}")
+    return embed
+
+
+def build_awarded_roll_embed(state: dict, roll_id: int) -> discord.Embed:
+    award = get_award_for_roll(roll_id)
+    title = state.get("title", "Roll")
+    embed = discord.Embed(title=f"🏆 {title}")
+    if award is None:
+        embed.description = "Award record not found."
+        return embed
+
+    name = discord.utils.escape_markdown(str(award.get("winner_name_at_award", "Unknown")))
+    roll_value = award.get("winning_roll")
+    status = "Active"
+    if award_is_voided(award):
+        status = "Voided"
+    elif award_is_returned(award):
+        status = "Returned"
+
+    lines = [f"**{name}**" + (f" — Roll **{roll_value}**" if roll_value is not None else "")]
+    if award.get("roll_mode") == "weapon":
+        count = award.get("fashion_count_at_award")
+        if count is not None:
+            lines.append(f"{count} fashion{'s' if int(count) != 1 else ''} at award")
+    if status != "Active":
+        lines.append(f"Status: **{status}**")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=f"Award #{award.get('log_id', '?')} • Roll ID: {roll_id}")
+    return embed
+
+
+def build_roll_info_content(state: dict, roll_id: int, viewer_id: int | None = None) -> str:
+    title = state.get("title", "Roll")
+    rows = get_roll_candidate_rows(state)
+    status = "Closed" if state.get("closed") else "Open"
+    lines = [
+        f"📊 **Roll Info — {title}**",
+        f"Status: **{status}** • Rolls: **{len(rows)}**",
+    ]
+    if viewer_id is not None:
+        viewer = state.get("rolls", {}).get(str(viewer_id))
+        lines.append(f"Your Roll: **{viewer.get('roll')}**" if viewer else "Your Roll: **Not rolled yet**")
+    if rows:
+        lines.extend(["", "**Top Rolls:**"])
+        for index, row in enumerate(rows[:20], start=1):
+            extra = ""
+            if state.get("roll_mode") == "weapon" and state.get("closed"):
+                count = int(row.get("fashion_count", 0) or 0)
+                extra = f" • {count} fashion{'s' if count != 1 else ''}"
+            lines.append(
+                f"{index}. **{discord.utils.escape_markdown(str(row.get('display_name', 'Unknown')))}** — {row.get('roll')}{extra}"
+            )
+    return "\n".join(lines)
+
+
+async def close_roll_window(roll_id: int, announce: bool = True) -> tuple[bool, str]:
+    state = get_roll_state(roll_id)
+    if state is None:
+        return False, "Roll window not found."
+    if state.get("closed"):
+        return False, "Roll window is already closed."
+
+    now = utcnow()
+    state["closed"] = True
+    state["closed_at"] = dt_to_str(now)
+    state["inventory_refreshed_at"] = dt_to_str(now)
+    save_state()
+
+    channel_id = state.get("channel_id")
+    channel = bot.get_channel(channel_id) if channel_id else None
+    if channel is None and channel_id:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            channel = None
+    if channel is None:
+        return True, "Roll closed, but I could not fetch the channel."
+
+    try:
+        message = await channel.fetch_message(roll_id)
+        await message.edit(
+            content=None,
+            embed=build_closed_roll_embed(state, roll_id),
+            view=ClosedRollView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    return True, "Roll window closed."
+
+
+async def handle_roll_button(interaction: discord.Interaction):
+    if interaction.message is None:
+        await interaction.response.send_message("Roll panel not found.", ephemeral=True)
+        return
+    roll_id = interaction.message.id
+    state = get_roll_state(roll_id)
+    if state is None:
+        await interaction.response.send_message("This roll window was not found.", ephemeral=True)
+        return
+
+    closes_at = str_to_dt(state.get("closes_at"))
+    if state.get("closed") or (closes_at and utcnow() >= closes_at):
+        if not state.get("closed"):
+            await close_roll_window(roll_id, announce=True)
+        await interaction.response.send_message("This roll window is closed.", ephemeral=True)
+        return
+
+    # Official fashion rolls intentionally do not enforce priority or inventory here.
+    # Everyone rolls; the Fashion Manager reviews live inventory after close.
+    await accept_roll(interaction, state, roll_id)
+
+
+async def handle_roll_info_button(interaction: discord.Interaction):
+    if interaction.message is None:
+        await interaction.response.send_message("Roll panel not found.", ephemeral=True)
+        return
+    roll_id = interaction.message.id
+    state = get_roll_state(roll_id)
+    if state is None:
+        await interaction.response.send_message("This roll window was not found.", ephemeral=True)
+        return
+    closes_at = str_to_dt(state.get("closes_at"))
+    if not state.get("closed") and closes_at and utcnow() >= closes_at:
+        await close_roll_window(roll_id, announce=True)
+    await interaction.response.send_message(
+        build_roll_info_content(state, roll_id, viewer_id=interaction.user.id),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+class RollView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Roll",
+        emoji="🎲",
+        style=discord.ButtonStyle.primary,
+        custom_id="bidbot_roll_button",
+    )
+    async def roll_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_roll_button(interaction)
+
+    @discord.ui.button(
+        label="Roll Info",
+        emoji="📊",
+        style=discord.ButtonStyle.secondary,
+        custom_id="bidbot_roll_info_button",
+    )
+    async def roll_info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_roll_info_button(interaction)
+
+
+class ClosedRollView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _leader_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and is_leader(interaction.user, interaction.guild):
+            return True
+        await interaction.response.send_message("Only leaders can manage closed fashion rolls.", ephemeral=True)
+        return False
+
+    @discord.ui.button(
+        label="Refresh Inventory",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        custom_id="bidbot_closed_roll_refresh",
+    )
+    async def refresh_inventory(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._leader_check(interaction):
+            return
+        if interaction.message is None:
+            await interaction.response.send_message("Roll panel not found.", ephemeral=True)
+            return
+        roll_id = interaction.message.id
+        state = get_roll_state(roll_id)
+        if state is None or not state.get("closed"):
+            await interaction.response.send_message("This closed roll was not found.", ephemeral=True)
+            return
+        if state.get("award_recorded") and get_award_for_roll(roll_id) is not None:
+            await interaction.response.send_message("This roll has already been awarded.", ephemeral=True)
+            return
+        state["inventory_refreshed_at"] = dt_to_str(utcnow())
+        save_state()
+        await interaction.response.edit_message(
+            content=None,
+            embed=build_closed_roll_embed(state, roll_id),
+            view=ClosedRollView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Award Player",
+        emoji="🏆",
+        style=discord.ButtonStyle.success,
+        custom_id="bidbot_closed_roll_award",
+    )
+    async def award_player(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._leader_check(interaction):
+            return
+        if interaction.message is None:
+            await interaction.response.send_message("Roll panel not found.", ephemeral=True)
+            return
+        roll_id = interaction.message.id
+        state = get_roll_state(roll_id)
+        if state is None or not state.get("closed"):
+            await interaction.response.send_message("This closed roll was not found.", ephemeral=True)
+            return
+        if state.get("award_recorded") and get_award_for_roll(roll_id) is not None:
+            await interaction.response.send_message("This roll has already been awarded.", ephemeral=True)
+            return
+
+        # Auto-refresh before building the selection list.
+        state["inventory_refreshed_at"] = dt_to_str(utcnow())
+        save_state()
+        try:
+            await interaction.message.edit(
+                content=None,
+                embed=build_closed_roll_embed(state, roll_id),
+                view=ClosedRollView(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        candidates = get_award_selection_rows(state)
+        if not candidates:
+            await interaction.response.send_message("Nobody rolled on this item.", ephemeral=True)
+            return
+        view = AwardPlayerView(roll_id=roll_id, candidates=candidates)
+        await interaction.response.send_message(
+            "Select the player receiving the item. **0-fashion players are listed first**, then everyone else by roll.",
+            view=view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Roll Info",
+        emoji="📊",
+        style=discord.ButtonStyle.secondary,
+        custom_id="bidbot_closed_roll_info",
+    )
+    async def roll_info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_roll_info_button(interaction)
+
+
+class AwardCandidateSelect(discord.ui.Select):
+    def __init__(self, parent_view: "AwardPlayerView", options: list[discord.SelectOption]):
+        super().__init__(
+            placeholder="Choose the player receiving the item",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.parent_view.show_confirmation(interaction, int(self.values[0]))
+
+
+class AwardPlayerView(discord.ui.View):
+    def __init__(self, roll_id: int, candidates: list[dict]):
+        super().__init__(timeout=300)
+        self.roll_id = roll_id
+        self.candidates = candidates
+        self.page = 0
+        self.per_page = 25
+        self.select: AwardCandidateSelect | None = None
+        self.rebuild_select()
+        self.update_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max((len(self.candidates) + self.per_page - 1) // self.per_page, 1)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and is_leader(interaction.user, interaction.guild):
+            return True
+        await interaction.response.send_message("Only leaders can award fashion items.", ephemeral=True)
+        return False
+
+    def refresh_candidates(self) -> None:
+        state = get_roll_state(self.roll_id)
+        if state is not None:
+            self.candidates = get_award_selection_rows(state)
+            self.page = min(self.page, self.total_pages - 1)
+
+    def page_options(self) -> list[discord.SelectOption]:
+        start = self.page * self.per_page
+        rows = self.candidates[start:start + self.per_page]
+        options = []
+        for row in rows:
+            display_name = str(row.get("display_name", "Unknown"))
+            roll_value = row.get("roll")
+            count = row.get("fashion_count")
+            if count is None:
+                description = f"Roll {roll_value}"
+                emoji = "🎲"
+            else:
+                count = int(count)
+                description = f"Roll {roll_value} • {count} fashion{'s' if count != 1 else ''}"
+                if row.get("owns_weapon"):
+                    description += " • already owns this weapon"
+                emoji = "⭐" if count == 0 else ("⚠️" if row.get("owns_weapon") else "🎲")
+            options.append(
+                discord.SelectOption(
+                    label=display_name[:100],
+                    value=str(int(row.get("user_id", 0))),
+                    description=description[:100],
+                    emoji=emoji,
+                )
+            )
+        return options
+
+    def rebuild_select(self) -> None:
+        if self.select is not None:
+            self.remove_item(self.select)
+        options = self.page_options()
+        if options:
+            self.select = AwardCandidateSelect(self, options)
+            self.add_item(self.select)
+        else:
+            self.select = None
+
+    def update_buttons(self) -> None:
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.total_pages - 1
+
+    @discord.ui.button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.refresh_candidates()
+        self.page = max(self.page - 1, 0)
+        self.rebuild_select()
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=f"Select the player receiving the item. Page **{self.page + 1}/{self.total_pages}**.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Next", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.refresh_candidates()
+        self.page = min(self.page + 1, self.total_pages - 1)
+        self.rebuild_select()
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=f"Select the player receiving the item. Page **{self.page + 1}/{self.total_pages}**.",
+            view=self,
+        )
+
+    async def show_confirmation(self, interaction: discord.Interaction, user_id: int):
+        state = get_roll_state(self.roll_id)
+        if state is None or not state.get("closed"):
+            await interaction.response.edit_message(content="This roll is no longer available.", view=None)
+            return
+        if get_award_for_roll(self.roll_id) is not None or state.get("award_recorded"):
+            await interaction.response.edit_message(content="This roll has already been awarded.", view=None)
+            return
+
+        current_rows = {int(row.get("user_id", 0)): row for row in get_roll_candidate_rows(state)}
+        row = current_rows.get(user_id)
+        if row is None:
+            await interaction.response.edit_message(content="That player is no longer in the roll.", view=None)
+            return
+
+        title = state.get("title", "this item")
+        name = discord.utils.escape_markdown(str(row.get("display_name", "Unknown")))
+        lines = [
+            f"🏆 Award **{title}** to **{name}**?",
+            f"Roll: **{row.get('roll')}**",
+        ]
+        if state.get("roll_mode") == "weapon":
+            count = int(row.get("fashion_count", 0) or 0)
+            lines.append(f"Current fashions: **{count}**")
+            if row.get("owns_weapon"):
+                lines.append(f"⚠️ **Already owns a {state.get('boss', '')} {state.get('weapon_type', '')}.**")
+        await interaction.response.edit_message(
+            content="\n".join(lines),
+            view=ConfirmAwardView(
+                self.roll_id,
+                user_id,
+                expected_count=row.get("fashion_count"),
+                expected_owns=bool(row.get("owns_weapon")),
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class ConfirmAwardView(discord.ui.View):
+    def __init__(
+        self,
+        roll_id: int,
+        user_id: int,
+        expected_count: int | None = None,
+        expected_owns: bool = False,
+    ):
+        super().__init__(timeout=120)
+        self.roll_id = roll_id
+        self.user_id = user_id
+        self.expected_count = expected_count
+        self.expected_owns = expected_owns
+        if expected_owns:
+            self.confirm.label = "Award Anyway"
+            self.confirm.style = discord.ButtonStyle.danger
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and is_leader(interaction.user, interaction.guild):
+            return True
+        await interaction.response.send_message("Only leaders can award fashion items.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Confirm Award", emoji="🏆", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.edit_message(content="Server not found.", view=None)
+            return
+        await interaction.response.defer(ephemeral=True)
+        success, message, _ = await record_roll_award(
+            interaction.guild,
+            interaction.user,
+            self.roll_id,
+            self.user_id,
+            expected_count=self.expected_count,
+            expected_owns=self.expected_owns,
+        )
+        await interaction.edit_original_response(content=message, view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Award cancelled.", view=None)
+
+
+class UndoAwardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Undo Award",
+        emoji="↩️",
+        style=discord.ButtonStyle.danger,
+        custom_id="bidbot_undo_award",
+    )
+    async def undo_award(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message("Only leaders can undo awards.", ephemeral=True)
+            return
+        if interaction.message is None:
+            await interaction.response.send_message("Award message not found.", ephemeral=True)
+            return
+        award = get_award_by_message_id(interaction.message.id)
+        if award is None:
+            await interaction.response.send_message("I could not find this award record.", ephemeral=True)
+            return
+        try:
+            embed = await process_award_void(interaction.guild, interaction.user, award)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+async def record_roll_award(
+    guild: discord.Guild,
+    actor: discord.Member | discord.User,
+    roll_id: int,
+    winner_user_id: int,
+    expected_count: int | None = None,
+    expected_owns: bool | None = None,
+) -> tuple[bool, str, dict | None]:
+    """Record a manager-selected winner after one final live inventory check."""
+    async with get_roll_lock(roll_id):
+        state = get_roll_state(roll_id)
+        if state is None:
+            return False, "That roll could not be found.", None
+        if not state.get("closed"):
+            return False, "That roll is still open.", None
+        if get_award_for_roll(roll_id) is not None or state.get("award_recorded"):
+            return False, "That roll has already been awarded.", None
+
+        selected_roll = state.get("rolls", {}).get(str(winner_user_id))
+        if selected_roll is None:
+            return False, "That player did not roll on this item.", None
+
+        winner_member = guild.get_member(winner_user_id)
+        if winner_member is None:
+            try:
+                winner_member = await guild.fetch_member(winner_user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                winner_member = None
+
+        # Final re-check after any await, so overlapping awards cannot use stale inventory.
+        if get_award_for_roll(roll_id) is not None or state.get("award_recorded"):
+            return False, "That roll was awarded by another manager while you were confirming.", None
+
+        boss = str(state.get("boss", ""))
+        weapon = str(state.get("weapon_type", ""))
+        fashion_count = None
+        owns_weapon = False
+        if state.get("roll_mode") == "weapon":
+            fashion_count = len(get_player_weapon_awards(guild.id, winner_user_id, boss=boss))
+            owns_weapon = player_has_boss_weapon_type(guild.id, winner_user_id, boss, weapon)
+            if expected_count is not None and int(expected_count) != int(fashion_count):
+                return (
+                    False,
+                    "Their fashion inventory changed while you were confirming. Reopen **Award Player** to review the current count.",
+                    None,
+                )
+            if expected_owns is not None and bool(expected_owns) != bool(owns_weapon):
+                return (
+                    False,
+                    "Their weapon inventory changed while you were confirming. Reopen **Award Player** to review it.",
+                    None,
+                )
+
+        winner_name = (
+            winner_member.display_name
+            if winner_member is not None
+            else str(selected_roll.get("display_name", "Unknown"))
+        )
+        now = utcnow()
+        log_id = next_award_log_id()
+        award_entry = {
+            "log_id": log_id,
+            "roll_id": roll_id,
+            "item": state.get("title", "Unknown item"),
+            "roll_mode": state.get("roll_mode", "fun"),
+            "boss": state.get("boss"),
+            "weapon_type": state.get("weapon_type"),
+            "winner_user_id": winner_user_id,
+            "winner_name_at_award": winner_name,
+            "winner_name_when_rolled": selected_roll.get("display_name", "Unknown"),
+            "winning_roll": selected_roll.get("roll"),
+            "selection_method": "manager_select",
+            "fashion_count_at_award": fashion_count,
+            "owned_same_weapon_at_award": owns_weapon,
+            "awarded_at": dt_to_str(now),
+            "recorded_by_user_id": actor.id,
+            "recorded_by_name": getattr(actor, "display_name", getattr(actor, "name", "Unknown")),
+            "guild_id": guild.id,
+            "channel_id": state.get("channel_id"),
+            "returned": False,
+            "returned_at": None,
+            "returned_by_user_id": None,
+            "returned_by_name": None,
+            "voided": False,
+            "voided_at": None,
+            "voided_by_user_id": None,
+            "voided_by_name": None,
+            "award_message_id": None,
+        }
+        award_log.append(award_entry)
+        state["award_recorded"] = True
+        state["award_log_id"] = log_id
+        state["award_winner_user_id"] = winner_user_id
+        state["award_recorded_at"] = dt_to_str(now)
+        state["award_recorded_by"] = actor.id
+        state["award_returned"] = False
+        state["award_voided"] = False
+        save_state()
+
+        channel_id = state.get("channel_id")
+        channel = bot.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+
+        if channel is not None:
+            try:
+                roll_message = await channel.fetch_message(roll_id)
+                await roll_message.edit(
+                    content=None,
+                    embed=build_awarded_roll_embed(state, roll_id),
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+            result = discord.Embed(title=f"🏆 {state.get('title', 'Award')}")
+            result.description = (
+                f"**{discord.utils.escape_markdown(winner_name)}** — Roll **{selected_roll.get('roll')}**"
+            )
+            if fashion_count is not None:
+                result.description += f"\n{fashion_count} fashion{'s' if fashion_count != 1 else ''} at award"
+            if owns_weapon:
+                result.description += f"\n⚠️ Already owned a **{boss} {weapon}** at award."
+            result.set_footer(text=f"Award #{log_id}")
+            try:
+                award_message = await channel.send(
+                    embed=result,
+                    view=UndoAwardView(),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                award_entry["award_message_id"] = award_message.id
+                state["award_message_id"] = award_message.id
+                save_state()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        return True, f"Award **#{log_id}** recorded to **{winner_name}**.", award_entry
+
+async def process_award_return(
+    guild: discord.Guild,
+    actor: discord.Member | discord.User,
+    target_award: dict,
+) -> discord.Embed:
+    """Mark a legitimate award returned while preserving permanent history."""
+    if award_is_voided(target_award):
+        raise ValueError("That award was voided and cannot be returned.")
+    if award_is_returned(target_award):
+        raise ValueError("That award has already been returned.")
+
+    now = utcnow()
+    target_award["returned"] = True
+    target_award["returned_at"] = dt_to_str(now)
+    target_award["returned_by_user_id"] = actor.id
+    target_award["returned_by_name"] = getattr(actor, "display_name", getattr(actor, "name", "Unknown"))
+
+    roll_id = int(target_award.get("roll_id", 0) or 0)
+    state = get_roll_state(roll_id) if roll_id else None
+    if state is not None and int(state.get("award_log_id", 0) or 0) == int(target_award.get("log_id", 0) or 0):
+        state["award_returned"] = True
+        state["award_returned_at"] = dt_to_str(now)
+        state["award_returned_by"] = actor.id
+
+    save_state()
+
+    if state is not None:
+        channel_id = state.get("channel_id")
+        channel = bot.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+        if channel is not None:
+            try:
+                roll_message = await channel.fetch_message(roll_id)
+                await roll_message.edit(
+                    content=None,
+                    embed=build_awarded_roll_embed(state, roll_id),
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    item = discord.utils.escape_markdown(str(target_award.get("item", "Unknown item")))
+    winner_id = int(target_award.get("winner_user_id", 0))
+    log_id = target_award.get("log_id", "?")
+    embed = discord.Embed(title="↩️ Award Returned", description=f"**{item}**")
+    embed.add_field(name="Award", value=f"#{log_id}", inline=True)
+    embed.add_field(name="Previous holder", value=f"<@{winner_id}>", inline=True)
+    return embed
+
+
+async def process_award_void(
+    guild: discord.Guild,
+    actor: discord.Member | discord.User,
+    target_award: dict,
+) -> discord.Embed:
+    """Undo a mistaken award, reopen the closed roll for manager selection, and keep audit history."""
+    if award_is_voided(target_award):
+        raise ValueError("That award has already been undone.")
+    if award_is_returned(target_award):
+        raise ValueError("Returned awards cannot be undone. They are legitimate historical awards.")
+
+    now = utcnow()
+    target_award["voided"] = True
+    target_award["voided_at"] = dt_to_str(now)
+    target_award["voided_by_user_id"] = actor.id
+    target_award["voided_by_name"] = getattr(actor, "display_name", getattr(actor, "name", "Unknown"))
+
+    roll_id = int(target_award.get("roll_id", 0) or 0)
+    state = get_roll_state(roll_id) if roll_id else None
+    if state is not None and int(state.get("award_log_id", 0) or 0) == int(target_award.get("log_id", 0) or 0):
+        state["award_recorded"] = False
+        state["award_log_id"] = None
+        state["award_winner_user_id"] = None
+        state["award_recorded_at"] = None
+        state["award_recorded_by"] = None
+        state["award_message_id"] = None
+        state["award_voided"] = True
+        state["inventory_refreshed_at"] = dt_to_str(now)
+    save_state()
+
+    if state is not None:
+        channel_id = state.get("channel_id")
+        channel = bot.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+        if channel is not None:
+            try:
+                roll_message = await channel.fetch_message(roll_id)
+                await roll_message.edit(
+                    content=None,
+                    embed=build_closed_roll_embed(state, roll_id),
+                    view=ClosedRollView(),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    item = discord.utils.escape_markdown(str(target_award.get("item", "Unknown item")))
+    log_id = target_award.get("log_id", "?")
+    embed = discord.Embed(title="❌ Award Undone", description=f"**#{log_id} — {item}**")
+    embed.add_field(name="Status", value="Voided • Roll is ready to award again", inline=False)
+    return embed
+
+class RollAwardReturnModal(discord.ui.Modal, title="Return Roll Award"):
+    item_number = discord.ui.TextInput(
+        label="Item list number",
+        placeholder="Example: 2",
+        required=True,
+        max_length=4,
+    )
+
+    def __init__(self, awards_view: "RollAwardsView"):
+        super().__init__()
+        self.awards_view = awards_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can return roll awards.",
+                ephemeral=True,
+            )
+            return
+
+        raw_number = str(self.item_number.value).strip().lstrip("#")
+        if not raw_number.isdigit():
+            await interaction.response.send_message(
+                "Enter the number shown beside the item, like `2`.",
+                ephemeral=True,
+            )
+            return
+
+        list_number = int(raw_number)
+        if list_number < 1 or list_number > len(self.awards_view.entries):
+            await interaction.response.send_message(
+                f"Choose a list number from **1–{len(self.awards_view.entries)}**.",
+                ephemeral=True,
+            )
+            return
+
+        selected = self.awards_view.entries[list_number - 1]
+        log_id = int(selected.get("log_id", 0) or 0)
+        target_award = get_active_award_by_log_id(interaction.guild.id, log_id)
+
+        if target_award is None:
+            await interaction.response.send_message(
+                "That item is no longer a current award. Run `/rollawards member:@Player` again to refresh the list.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            confirmation = await process_award_return(
+                interaction.guild,
+                interaction.user,
+                target_award,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        # Remove the returned item from this exact list so the embed refreshes immediately.
+        self.awards_view.entries = [
+            entry
+            for entry in self.awards_view.entries
+            if int(entry.get("log_id", 0) or 0) != log_id
+        ]
+        self.awards_view.page = min(
+            self.awards_view.page,
+            self.awards_view.total_pages - 1,
+        )
+        self.awards_view.update_buttons()
+
+        await interaction.response.send_message(
+            embed=confirmation,
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        if self.awards_view.message is not None:
+            try:
+                await self.awards_view.message.edit(
+                    content=None,
+                    embed=self.awards_view.embed(),
+                    view=self.awards_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
+class RollAwardsView(discord.ui.View):
+    def __init__(
+        self,
+        requester_id: int,
+        entries: list[dict],
+        member_id: int | None = None,
+        item_query: str | None = None,
+        per_page: int = 15,
+        can_return: bool = False,
+        highlight_log_id: int | None = None,
+    ):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.entries = entries
+        self.member_id = member_id
+        self.item_query = item_query
+        self.per_page = per_page
+        self.page = 0
+        self.can_return = can_return and member_id is not None
+        self.highlight_log_id = highlight_log_id
+        self.message: discord.Message | None = None
+
+        if not self.can_return:
+            self.remove_item(self.return_item)
+
+        self.update_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max((len(self.entries) + self.per_page - 1) // self.per_page, 1)
+
+    def update_buttons(self) -> None:
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.total_pages - 1
+        if self.can_return:
+            self.return_item.disabled = len(self.entries) == 0
+
+    def embed(self) -> discord.Embed:
+        return build_roll_awards_embed(
+            self.entries,
+            self.page,
+            self.per_page,
+            member_id=self.member_id,
+            item_query=self.item_query,
+            highlight_log_id=self.highlight_log_id,
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+
+        # Award-management views are leader controls. Any leader can use the
+        # pagination/refund buttons even if another leader created the message.
+        if (
+            self.can_return
+            and interaction.guild is not None
+            and is_leader(interaction.user, interaction.guild)
+        ):
+            return True
+
+        message = (
+            "Only leaders can use these award controls."
+            if self.can_return
+            else "Run `/rollawards` yourself to browse this list."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return False
+
+    @discord.ui.button(
+        label="Previous",
+        emoji="◀️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def previous_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.page = max(self.page - 1, 0)
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Next",
+        emoji="▶️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def next_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.page = min(self.page + 1, self.total_pages - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Refund / Return Item",
+        emoji="↩️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def return_item(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders can return roll awards.",
+                ephemeral=True,
+            )
+            return
+
+        if not self.entries:
+            await interaction.response.send_message(
+                "There are no current items to return.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(RollAwardReturnModal(self))
+
+
+class RollAuditView(discord.ui.View):
+    def __init__(
+        self,
+        requester_id: int,
+        entries: list[dict],
+        member_id: int | None = None,
+        item_query: str | None = None,
+        per_page: int = 15,
+    ):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.entries = entries
+        self.member_id = member_id
+        self.item_query = item_query
+        self.per_page = per_page
+        self.page = 0
+        self.update_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max((len(self.entries) + self.per_page - 1) // self.per_page, 1)
+
+    def update_buttons(self) -> None:
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.total_pages - 1
+
+    def embed(self) -> discord.Embed:
+        return build_roll_audit_embed(
+            self.entries,
+            self.page,
+            self.per_page,
+            member_id=self.member_id,
+            item_query=self.item_query,
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+
+        await interaction.response.send_message(
+            "Run `/rollaudit` yourself to browse the audit.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Previous",
+        emoji="◀️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def previous_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.page = max(self.page - 1, 0)
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(
+        label="Next",
+        emoji="▶️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def next_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.page = min(self.page + 1, self.total_pages - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=None,
+            embed=self.embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot lifecycle
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@bot.event
+async def on_ready():
+    global roll_views_registered
+
+    load_state()
+    load_fashion_state()
+
+    if not roll_views_registered:
+        bot.add_view(RollView())
+        bot.add_view(ClosedRollView())
+        bot.add_view(UndoAwardView())
+        bot.add_view(FashionTrackerView())
+        roll_views_registered = True
+
+    await bot.tree.sync()
+
+    if not phase_checker.is_running():
+        phase_checker.start()
+
+    if not roll_checker.is_running():
+        roll_checker.start()
+
+    print(f"Logged in as {bot.user}")
+    print("Phase checker running:", phase_checker.is_running())
+    print("Roll checker running:", roll_checker.is_running())
+    print("Loaded bid states:", len(bid_state))
+    print("Loaded roll states:", len(roll_state))
+    print("Loaded roll awards:", len(award_log))
+    
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Thread chat discouragement
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    channel = message.channel
+
+    # Only monitor threads
+    if not isinstance(channel, discord.Thread):
+        await bot.process_commands(message)
+        return
+
+    # Only monitor allowed bid channels
+    if not is_allowed_channel(channel):
+        await bot.process_commands(message)
+        return
+
+    # Only monitor active bid threads
+    state = get_state(channel.id)
+    if state is None:
+        await bot.process_commands(message)
+        return
+
+    content = (message.content or "").strip().lower()
+
+    # User opts out of the current bid.
+    # In Phase 1, they can rejoin by placing another valid bid before Phase 2.
+    # In Phase 2, opting out is final for this bid.
+    if content == "out":
+        state.setdefault("opted_out_bidders", set()).add(message.author.id)
+        save_state()
+
+        if state.get("phase") == 2:
+            message_text = (
+                f"🚪 {message.author.mention} is out and cannot re-enter this bid."
+            )
+        else:
+            message_text = (
+                f"🚪 {message.author.mention} is out. "
+                "They can rejoin by placing another valid bid before Phase 2 begins."
+            )
+
+        await channel.send(
+            message_text,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+        return
+
+    # Allow leader comments
+    if is_leader(message.author, message.guild):
+        await bot.process_commands(message)
+        return
+
+    # Allow approved utility commands
+    ALLOWED_THREAD_PREFIXES = (
+        "%pay",
+        "%undo",
+        "%refund",
+    )
+
+    if any(content.startswith(prefix) for prefix in ALLOWED_THREAD_PREFIXES):
+        await bot.process_commands(message)
+        return
+
+
+    # Global bid-chat switch. When censorship is disabled, normal conversation
+    # is allowed in bid threads and the bot does not react or warn.
+    if not bid_chat_censorship_enabled:
+        await bot.process_commands(message)
+        return
+
+    # React to chatter
+    try:
+        await message.add_reaction("❌")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    # Warning message
+    try:
+        await channel.send(
+            f"{message.author.mention} Please keep this thread clean. "
+            "Use `/bid` to bid, `/review` for concerns, `out` to stop future mentions, or approved mod payout commands.",
+            delete_after=12,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    await bot.process_commands(message)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background phase watcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@tasks.loop(minutes=1)
+async def phase_checker():
+    now = utcnow()
+    dirty = False
+
+    for thread_id, state in list(bid_state.items()):
+
+        print(f"[PHASE CHECK] Thread {thread_id} | Phase: {state['phase']}")
+
+        # Skip already closed bids
+        if state.get("closed") or state.get("phase") == 3:
+            continue
+
+        # Skip paused bids completely so phases and close timers do not progress
+        if state.get("paused"):
+            continue
+
+        thread = bot.get_channel(thread_id)
+
+        if thread is None:
+            try:
+                thread = await bot.fetch_channel(thread_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+
+        phase1_start = str_to_dt(state.get("phase1_start"))
+        last_bid_time = str_to_dt(state.get("last_bid_time"))
+
+        if phase1_start is None or last_bid_time is None:
+            continue
+
+        # ─────────────────────────────────────────────
+        # Move to Phase 2 after 24h
+        # ─────────────────────────────────────────────
+        if state["phase"] == 1 and now >= phase1_start + timedelta(hours=24):
+
+            state["phase"] = 2
+            dirty = True
+
+            if not state.get("phase2_announced", False):
+
+                bidders = state.get("phase1_bidders", set())
+                opted_out = state.get("opted_out_bidders", set())
+
+                mentions = " ".join(
+                    f"<@{uid}>"
+                    for uid in bidders
+                    if uid not in opted_out
+                )
+
+                if mentions:
+                    await thread.send(
+                        "⏰ **Phase 2 — Restricted Bidding**\n"
+                        "Only users who placed a valid bid in the first 24 hours can continue bidding.\n"
+                        f"{mentions}",
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                else:
+                    await thread.send(
+                        "⏰ **Phase 2 — Restricted Bidding**\n"
+                        "No eligible phase 1 bidders remain."
+                    )
+
+                state["phase2_announced"] = True
+                dirty = True
+
+        # ─────────────────────────────────────────────
+        # Close bidding 12h after last valid phase 2 bid
+        # ─────────────────────────────────────────────
+        if state["phase"] == 2 and now >= last_bid_time + timedelta(hours=12):
+
+            state["phase"] = 3
+            state["closed"] = True
+            dirty = True
+
+            if not state.get("closed_announced", False):
+
+                last_valid = state.get("last_valid_bid")
+
+                if last_valid:
+                    toon = last_valid["toon"]
+                    amount = last_valid["amount"]
+
+                    await thread.send(
+                        "🔒 **Bidding Closed**\n"
+                        f"Final bid: **{toon}** — **{amount:,}**\n"
+                        f"Cash out with: `%pay {toon} {amount}`"
+                    )
+                else:
+                    await thread.send(
+                        "🔒 **Bidding Closed** — No valid bids recorded."
+                    )
+
+                state["closed_announced"] = True
+                dirty = True
+
+    if dirty:
+        save_state()
+
+@phase_checker.before_loop
+async def before_phase_checker():
+    await bot.wait_until_ready()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background roll watcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@tasks.loop(minutes=1)
+async def roll_checker():
+    now = utcnow()
+    for roll_id, state in list(roll_state.items()):
+        if state.get("closed"):
+            continue
+        closes_at = str_to_dt(state.get("closes_at"))
+        if closes_at and now >= closes_at:
+            await close_roll_window(roll_id, announce=True)
+
+@roll_checker.before_loop
+async def before_roll_checker():
+    await bot.wait_until_ready()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Commands
+# ──────────────────────────────────────────────────────────────────────────────
+
+@bot.tree.command(
+    name="bidchat",
+    description="Globally allow or restrict normal chat in bid threads",
+)
+@app_commands.describe(
+    mode="Choose whether normal conversation is allowed in bid threads",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="Allow chat", value="allow"),
+        app_commands.Choice(name="Restrict chat", value="restrict"),
+    ]
+)
+async def bidchat(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+):
+    global bid_chat_censorship_enabled
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can change the bid-chat setting.",
+            ephemeral=True,
+        )
+        return
+
+    allow_chat = mode.value == "allow"
+    bid_chat_censorship_enabled = not allow_chat
+    save_state()
+
+    if allow_chat:
+        status = (
+            "💬 **Bid chat is now ON globally.**\n"
+            "People can talk normally inside bid threads. `out` and bot commands still work."
+        )
+    else:
+        status = (
+            "🔇 **Bid chat is now RESTRICTED globally.**\n"
+            "Normal chatter in bid threads will be flagged again."
+        )
+
+    await interaction.response.send_message(status)
+
+
+@bot.tree.command(name="roll", description="Open a 24-hour fashion weapon roll")
+@app_commands.describe(
+    boss="Boss the weapon dropped from",
+    weapon_type="Weapon type being awarded",
+)
+@app_commands.choices(
+    boss=[app_commands.Choice(name=name, value=name) for name in ROLL_BOSSES],
+    weapon_type=[app_commands.Choice(name=name, value=name) for name in ROLL_WEAPON_TYPES],
+)
+async def roll(
+    interaction: discord.Interaction,
+    boss: app_commands.Choice[str],
+    weapon_type: app_commands.Choice[str],
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        return
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message("Only leaders can open roll panels.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    boss_name = boss.value
+    weapon_name = weapon_type.value
+    title = f"{boss_name} {weapon_name}"
+    now = utcnow()
+
+    await interaction.response.send_message(
+        f"🎲 **{title}**\nSetting up roll panel...",
+        view=RollView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    sent = await interaction.original_response()
+
+    roll_state[sent.id] = {
+        "roll_mode": "weapon",
+        "title": title,
+        "boss": boss_name,
+        "weapon_type": weapon_name,
+        "guild_id": interaction.guild.id,
+        "channel_id": channel.id,
+        "message_id": sent.id,
+        "created_by": interaction.user.id,
+        "created_at": dt_to_str(now),
+        "closes_at": dt_to_str(now + timedelta(hours=24)),
+        "closed": False,
+        "closed_at": None,
+        "inventory_refreshed_at": None,
+        "award_recorded": False,
+        "rolls": {},
+    }
+    save_state()
+    await sent.edit(content=build_roll_panel_content(roll_state[sent.id], sent.id), embed=None, view=RollView())
+
+
+@bot.tree.command(name="weaponcheck", description="Show how a player's current weapon awards are classified")
+@app_commands.describe(member="Player to check. Defaults to you.")
+async def weaponcheck(interaction: discord.Interaction, member: discord.Member | None = None):
+    """Leader-only audit showing exactly how active award names are classified."""
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can use `/weaponcheck`.", ephemeral=True)
+        return
+
+    member = member or interaction.user
+    active_entries = [
+        entry
+        for entry in award_log
+        if int(entry.get("guild_id", 0)) == interaction.guild.id
+        and int(entry.get("winner_user_id", 0)) == member.id
+        and not award_is_returned(entry)
+        and not award_is_voided(entry)
+    ]
+
+    recognized = []
+    unrecognized = []
+    for entry in active_entries:
+        boss_name = award_boss_type(entry)
+        weapon_name = award_weapon_type(entry)
+        if boss_name and weapon_name:
+            recognized.append((boss_name, weapon_name, entry))
+        elif boss_name or weapon_name:
+            unrecognized.append((boss_name, weapon_name, entry))
+
+    lines = [f"🔎 **Weapon Check — {discord.utils.escape_markdown(member.display_name)}**"]
+
+    if recognized:
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for boss_name, weapon_name, entry in recognized:
+            grouped.setdefault(boss_name, []).append((weapon_name, entry))
+
+        for boss_name in sorted(grouped):
+            lines.extend(["", f"**{boss_name}**"])
+            for weapon_name, entry in sorted(
+                grouped[boss_name],
+                key=lambda pair: (pair[0].casefold(), int(pair[1].get("log_id", 0) or 0)),
+            ):
+                item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+                log_id = entry.get("log_id", "?")
+                lines.append(f"• #{log_id} `{item}` → **{weapon_name}**")
+    else:
+        lines.extend(["", "No fully recognized active boss/weapon awards."])
+
+    if unrecognized:
+        lines.extend(["", "**Needs Review**"])
+        for boss_name, weapon_name, entry in unrecognized:
+            item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+            log_id = entry.get("log_id", "?")
+            boss_label = boss_name or "? boss"
+            weapon_label = weapon_name or "? weapon"
+            lines.append(f"• #{log_id} `{item}` → {boss_label} / {weapon_label}")
+
+    lines.extend([
+        "",
+        f"Recognized current fashions: **{len(recognized)}**",
+        "Aliases: Dhio / Dino / Dhino / Voidsworn → **Dhiothu**",
+    ])
+
+    await slash_send(
+        interaction,
+        "\n".join(lines),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+@bot.tree.command(name="funroll", description="Open a simple unrestricted fun roll")
+@app_commands.describe(
+    title="What this fun roll is for",
+    duration_hours="How long the roll stays open. Default is 24 hours.",
+)
+async def funroll(
+    interaction: discord.Interaction,
+    title: str,
+    duration_hours: int = 24,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message("Use this in bid channels only.", ephemeral=True)
+        return
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message("Only leaders can open roll panels.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    title = title.strip()
+    if not title:
+        await interaction.response.send_message("Roll title cannot be blank.", ephemeral=True)
+        return
+    if duration_hours <= 0:
+        await interaction.response.send_message("Duration must be at least 1 hour.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"🎲 **Fun Roll Open — {title}**\nSetting up roll panel...",
+        view=RollView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    sent = await interaction.original_response()
+    now = utcnow()
+    roll_state[sent.id] = {
+        "roll_mode": "fun",
+        "title": title,
+        "guild_id": interaction.guild.id,
+        "channel_id": channel.id,
+        "message_id": sent.id,
+        "created_by": interaction.user.id,
+        "created_at": dt_to_str(now),
+        "closes_at": dt_to_str(now + timedelta(hours=duration_hours)),
+        "closed": False,
+        "closed_at": None,
+        "award_recorded": False,
+        "rolls": {},
+    }
+    save_state()
+    await sent.edit(content=build_roll_panel_content(roll_state[sent.id], sent.id), view=RollView())
+
+
+@bot.tree.command(name="closeroll", description="Close a roll panel early")
+@app_commands.describe(
+    roll_id="The Roll ID shown on the roll panel",
+)
+async def closeroll(interaction: discord.Interaction, roll_id: str):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can close roll panels.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        parsed_roll_id = int(roll_id.strip())
+    except ValueError:
+        await interaction.response.send_message(
+            "Roll ID must be the number shown on the roll panel.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    success, message = await close_roll_window(
+        parsed_roll_id,
+        announce=True,
+    )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="recordaward", description="Manually award a closed roll to one of its rollers")
+@app_commands.describe(
+    winner="Player receiving the item",
+    roll_id="Optional Roll ID. Leave blank when using the roll's channel/thread.",
+)
+async def recordaward(
+    interaction: discord.Interaction,
+    winner: discord.Member,
+    roll_id: str | None = None,
+):
+    if not is_allowed_channel(interaction.channel):
+        await slash_send(interaction, "Use this in an allowed bid or roll channel.", ephemeral=True)
+        return
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can record roll awards.", ephemeral=True)
+        return
+
+    if roll_id is not None and roll_id.strip():
+        try:
+            parsed_roll_id = int(roll_id.strip())
+        except ValueError:
+            await slash_send(interaction, "Roll ID must be the number shown on the roll panel.", ephemeral=True)
+            return
+        state = get_roll_state(parsed_roll_id)
+    else:
+        channel_roll = get_roll_for_channel(interaction.channel.id, interaction.guild.id)
+        if channel_roll is None:
+            await slash_send(interaction, "I could not find a roll connected to this channel/thread.", ephemeral=True)
+            return
+        parsed_roll_id, state = channel_roll
+
+    if state is None:
+        await slash_send(interaction, "That roll could not be found.", ephemeral=True)
+        return
+    closes_at = str_to_dt(state.get("closes_at"))
+    if not state.get("closed"):
+        if closes_at and utcnow() >= closes_at:
+            await close_roll_window(parsed_roll_id, announce=True)
+        else:
+            await slash_send(interaction, "That roll is still open.", ephemeral=True)
+            return
+
+    await interaction.response.defer(ephemeral=True)
+    success, message, _ = await record_roll_award(
+        interaction.guild, interaction.user, parsed_roll_id, winner.id
+    )
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@bot.tree.command(name="rollawards", description="Browse current roll awards")
+@app_commands.describe(
+    member="Optional player to filter by",
+    item="Optional item-name filter",
+)
+async def rollawards(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    item: str | None = None,
+):
+    if interaction.guild is None:
+        await slash_send(interaction, "This command can only be used in a server.", ephemeral=True)
+        return
+
+    item_query = " ".join((item or "").split()) or None
+    member_id = member.id if member is not None else None
+
+    entries = get_filtered_roll_awards(
+        guild_id=interaction.guild.id,
+        member_id=member_id,
+        item_query=item_query,
+        include_returned=False,
+    )
+
+    can_return = (
+        member_id is not None
+        and is_leader(interaction.user, interaction.guild)
+        and len(entries) > 0
+    )
+
+    view = None
+    if len(entries) > 15 or can_return:
+        view = RollAwardsView(
+            requester_id=interaction.user.id,
+            entries=entries,
+            member_id=member_id,
+            item_query=item_query,
+            per_page=15,
+            can_return=can_return,
+        )
+
+    embed = build_roll_awards_embed(
+        entries,
+        page=0,
+        per_page=15,
+        member_id=member_id,
+        item_query=item_query,
+    )
+
+    sent = await slash_send(
+        interaction,
+        embed=embed,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    if view is not None:
+        view.message = sent
+
+@bot.tree.command(name="rollaudit", description="View compact roll history, including returns and undone awards")
+@app_commands.describe(
+    member="Optional player to filter by",
+    item="Optional item-name filter",
+)
+async def rollaudit(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    item: str | None = None,
+):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can view the roll audit.", ephemeral=True)
+        return
+
+    item_query = " ".join((item or "").split()) or None
+    member_id = member.id if member is not None else None
+
+    entries = get_filtered_roll_awards(
+        guild_id=interaction.guild.id,
+        member_id=member_id,
+        item_query=item_query,
+        include_returned=True,
+    )
+
+    view = None
+    if len(entries) > 15:
+        view = RollAuditView(
+            requester_id=interaction.user.id,
+            entries=entries,
+            member_id=member_id,
+            item_query=item_query,
+            per_page=15,
+        )
+
+    embed = build_roll_audit_embed(
+        entries,
+        page=0,
+        per_page=15,
+        member_id=member_id,
+        item_query=item_query,
+    )
+
+    await slash_send(
+        interaction,
+        embed=embed,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+@bot.tree.command(name="undoaward", description="Undo a mistaken roll award and reopen it for awarding")
+@app_commands.describe(award_number="Award # to void")
+async def undoaward(interaction: discord.Interaction, award_number: int):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can undo awards.", ephemeral=True)
+        return
+    target = next(
+        (entry for entry in award_log
+         if int(entry.get("guild_id", 0)) == interaction.guild.id
+         and int(entry.get("log_id", 0)) == award_number),
+        None,
+    )
+    if target is None:
+        await slash_send(interaction, "That award number was not found.", ephemeral=True)
+        return
+    try:
+        embed = await process_award_void(interaction.guild, interaction.user, target)
+    except ValueError as exc:
+        await slash_send(interaction, str(exc), ephemeral=True)
+        return
+    await slash_send(interaction, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="returnaward", description="Mark a current roll award as returned")
+@app_commands.describe(
+    award_number="Exact award # from the audit",
+    member="Player whose current-item list you want to use",
+    list_number="Item number shown by /rollawards for that player",
+    item="Optional item-name match for that player",
+)
+async def returnaward(
+    interaction: discord.Interaction,
+    award_number: int | None = None,
+    member: discord.Member | None = None,
+    list_number: int | None = None,
+    item: str | None = None,
+):
+    """Return by current thread, exact award #, or player + list number/item."""
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can return roll awards.", ephemeral=True)
+        return
+
+    supplied_modes = sum([
+        award_number is not None,
+        member is not None or list_number is not None or bool((item or "").strip()),
+    ])
+    if award_number is not None and (member is not None or list_number is not None or (item or "").strip()):
+        await slash_send(
+            interaction,
+            "Use either **award_number** OR the player/list fields, not both.",
+            ephemeral=True,
+        )
+        return
+
+    target_award: dict | None = None
+
+    if award_number is not None:
+        target_award = get_active_award_by_log_id(interaction.guild.id, award_number)
+        if target_award is None:
+            await slash_send(
+                interaction,
+                "That award number was not found, belongs to another server, or is no longer a current award.",
+                ephemeral=True,
+            )
+            return
+
+    elif member is not None:
+        player_entries = get_filtered_roll_awards(
+            guild_id=interaction.guild.id,
+            member_id=member.id,
+            include_returned=False,
+        )
+
+        if list_number is not None:
+            if list_number < 1 or list_number > len(player_entries):
+                await slash_send(
+                    interaction,
+                    f"That player has **{len(player_entries)}** current items. Choose a list number from 1–{len(player_entries)}.",
+                    ephemeral=True,
+                )
+                return
+            target_award = player_entries[list_number - 1]
+        elif (item or "").strip():
+            matches = get_filtered_roll_awards(
+                guild_id=interaction.guild.id,
+                member_id=member.id,
+                item_query=(item or "").strip(),
+                include_returned=False,
+            )
+            if not matches:
+                await slash_send(interaction, "I couldn't find a current award matching that item.", ephemeral=True)
+                return
+            if len(matches) > 1:
+                await slash_send(
+                    interaction,
+                    "That matches more than one item. Use `/rollawards member:@Player` and enter the visible **list_number** instead.",
+                    ephemeral=True,
+                )
+                return
+            target_award = matches[0]
+        else:
+            await slash_send(
+                interaction,
+                "Choose a **list_number** or enter an **item** when selecting a player.",
+                ephemeral=True,
+            )
+            return
+
+    elif list_number is not None or (item or "").strip():
+        await slash_send(interaction, "Choose a **member** when using list_number or item.", ephemeral=True)
+        return
+
+    else:
+        if interaction.channel is None:
+            await slash_send(interaction, "Channel not found.", ephemeral=True)
+            return
+        target_award = get_active_award_for_channel(interaction.channel.id, interaction.guild.id)
+        if target_award is None:
+            await slash_send(
+                interaction,
+                "I couldn't find a current award tied to this channel/thread. Use `/rollawards` or provide an award number.",
+                ephemeral=True,
+            )
+            return
+
+    try:
+        embed = await process_award_return(interaction.guild, interaction.user, target_award)
+    except ValueError as exc:
+        await slash_send(interaction, str(exc), ephemeral=True)
+        return
+
+    await slash_send(
+        interaction,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+@bot.tree.command(name="ping")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong")
+
+
+@bot.tree.command(name="open", description="Open a new bid thread")
+@app_commands.describe(
+    toon="The toon name for the opening bid",
+    amount="Opening bid amount",
+    min_bid="Minimum bid amount for this item",
+)
+async def open_bid(
+    interaction: discord.Interaction, toon: str, amount: int, min_bid: int
+):
+    channel = interaction.channel
+
+    if not is_allowed_channel(channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    if get_state(channel.id) is not None:
+        await interaction.response.send_message(
+            "A bid is already open in this thread. Use `/bid` to outbid.",
+            ephemeral=True,
+        )
+        return
+
+    if min_bid < 0 or amount < 0:
+        await interaction.response.send_message(
+            "Amounts cannot be negative.",
+            ephemeral=True,
+        )
+        return
+
+    if amount < min_bid:
+        await interaction.response.send_message(
+            f"Opening bid **{amount:,}** is below the minimum bid **{min_bid:,}**.",
+            ephemeral=True,
+        )
+        return
+
+    outbid_inc = min_outbid_from_min_bid(min_bid)
+
+    await interaction.response.send_message(
+        f"✅ Bid opened\n"
+        f"{toon} {amount:,} | Min bid: {min_bid:,} | Min outbid: {outbid_inc:,}",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    sent = await interaction.original_response()
+
+    init_state(
+        thread_id=channel.id,
+        toon=toon,
+        amount=amount,
+        min_bid=min_bid,
+        bidder_id=interaction.user.id,
+        message_id=sent.id,
+    )
+    save_state()
+
+
+@bot.tree.command(name="bid", description="Place an outbid")
+@app_commands.describe(
+    toon="The toon name you are bidding on", amount="Your bid amount"
+)
+async def bid(interaction: discord.Interaction, toon: str, amount: int):
+    channel = interaction.channel
+
+    async def reply(message: str, ephemeral: bool = True):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(message, ephemeral=ephemeral)
+
+    if not isinstance(channel, discord.Thread):
+        await reply("Bids must be placed inside a bid thread.")
+        return
+
+    if not is_allowed_channel(channel):
+        await reply("This is not a valid bidding channel.")
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await reply("No bid is open in this thread. Use `/open` first.")
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state["phase"] == 3 or state["closed"]:
+            await reply("🔒 Bidding is closed for this item.")
+            return
+
+        if state.get("paused"):
+            reason = state.get("pause_reason") or "Leadership review"
+
+            await reply(
+                f"⏸️ Bidding is currently paused.\n"
+                f"Reason: {reason}"
+            )
+            return
+
+        phase1_bidders = state.get("phase1_bidders", set())
+        if (
+            state["phase"] == 2
+            and interaction.user.id not in phase1_bidders
+        ):
+            await reply(
+                "⏰ Bidding is in Phase 2 and restricted to users who placed a valid bid in the first 24 hours."
+            )
+            return
+
+        if (
+            state["phase"] == 2
+            and interaction.user.id in state.get("opted_out_bidders", set())
+        ):
+            await reply(
+                "❌ You opted out during Phase 2 and cannot re-enter this bid."
+            )
+            return
+
+        user_bid_count = count_user_bids(state, interaction.user.id)
+
+        if user_bid_count >= 7:
+            await reply(
+                f"❌ You have reached the maximum of 7 bids for this item. ({user_bid_count}/7)"
+            )
+            return
+
+        if amount < 0:
+            await reply("Bid cannot be negative.")
+            return
+
+        current = state["current_bid"]
+        min_bid = state["min_bid"]
+        min_outbid = state["outbid_inc"]
+
+        if current is None:
+            if amount < min_bid:
+                await reply(f"Opening bid must be at least {min_bid:,}.")
+                return
+        else:
+            required = current + min_outbid
+            if amount < required:
+                await reply(f"You must bid at least {required:,}.")
+                return
+
+        now_str = datetime.now(timezone.utc).isoformat()
+        bid_number = len(state.get("bid_log", [])) + 1
+
+        state["current_bid"] = amount
+        state["current_toon"] = toon
+        state["current_bidder_id"] = interaction.user.id
+        state["last_bid_time"] = now_str
+
+        phase1_start = str_to_dt(state.get("phase1_start"))
+        if phase1_start and datetime.now(timezone.utc) <= phase1_start + timedelta(
+            hours=24
+        ):
+            state["phase1_bidders"].add(interaction.user.id)
+
+            # A valid Phase 1 bid rejoins someone who previously said "out".
+            state.setdefault("opted_out_bidders", set()).discard(interaction.user.id)
+
+        state["last_valid_bid"] = {
+            "bid_number": bid_number,
+            "toon": toon,
+            "amount": amount,
+            "bidder_id": interaction.user.id,
+            "message_id": None,
+            "timestamp": now_str,
+        }
+
+        state.setdefault("bid_log", []).append(
+            {
+                "bid_number": bid_number,
+                "toon": toon,
+                "amount": amount,
+                "bidder_id": interaction.user.id,
+                "message_id": None,
+                "timestamp": now_str,
+                "valid": True,
+                "reason": None,
+            }
+        )
+
+        remaining = 7 - (user_bid_count + 1)
+
+        participants = state.get("phase1_bidders", set())
+        opted_out = state.get("opted_out_bidders", set())
+        mentions = " ".join(f"<@{uid}>" for uid in participants if uid not in opted_out)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"💰 **New Bid #{bid_number}!**\n"
+                f"__**{toon}**__ → {amount:,}\n"
+                f"Next min: {amount + min_outbid:,}\n"
+                f"Bids remaining: {remaining}\n"
+                f"{mentions}",
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        else:
+            await interaction.followup.send(
+                f"💰 **New Bid #{bid_number}!**\n"
+                f"__**{toon}**__ → {amount:,}\n"
+                f"Next min: {amount + min_outbid:,}\n"
+                f"Bids remaining: {remaining}\n"
+                f"{mentions}",
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+
+        sent = await interaction.original_response()
+
+        state["last_valid_bid"]["message_id"] = sent.id
+        state["bid_log"][-1]["message_id"] = sent.id
+
+        save_state()
+
+
+@bot.tree.command(name="history", description="Show bid history for this thread")
+async def history(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No bid is open in this thread.", ephemeral=True
+        )
+        return
+
+    bid_log = state.get("bid_log", [])
+
+    if not bid_log:
+        await interaction.response.send_message("No bids recorded yet.", ephemeral=True)
+        return
+
+    lines = ["📜 **Bid History**"]
+
+    for entry in bid_log[-20:]:
+        bid_number = entry.get("bid_number", "?")
+        toon = entry.get("toon", "Unknown")
+        amount = entry.get("amount", 0)
+        valid = entry.get("valid", False)
+
+        status = "✅"
+        extra = ""
+
+        if not valid:
+            status = "❌"
+            reason = entry.get("reason")
+            if reason:
+                extra = f" — {reason}"
+
+        elif entry.get("corrected"):
+            status = "✏️"
+            old_amount = entry.get("old_amount")
+            reason = entry.get("correction_reason")
+            if old_amount:
+                extra = f" — was {old_amount:,}"
+            if reason:
+                extra += f" — {reason}"
+
+        lines.append(f"{status} **#{bid_number}** — **{toon}**: **{amount:,}**{extra}")
+
+    if len(bid_log) > 20:
+        lines.append(f"\nShowing last 20 of {len(bid_log)} bids.")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="review", description="Flag a concern for leaders")
+@app_commands.describe(reason="Briefly describe the issue")
+async def review(interaction: discord.Interaction, reason: str):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message("Guild not found.", ephemeral=True)
+        return
+
+    mentions = [f"<@&{role_id}>" for role_id in LEADER_ROLE_IDS]
+
+    await interaction.response.send_message(
+        f"{' '.join(mentions)} Review requested by {interaction.user.mention}: {reason}",
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+    )
+
+
+@bot.tree.command(name="bidinfo", description="Show current bid info for this thread")
+async def bidinfo(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No bid is open in this thread.", ephemeral=True
+        )
+        return
+
+    now = utcnow()
+    phase1_start = str_to_dt(state["phase1_start"])
+    last_bid_time = str_to_dt(state["last_bid_time"])
+    paused = state.get("paused", False)
+    pause_reason = state.get("pause_reason") or "N/A"
+
+    phase2_eta = "N/A"
+    close_eta = "N/A"
+
+    if phase1_start and state["phase"] == 1:
+        delta = (phase1_start + timedelta(hours=24)) - now
+        total = max(int(delta.total_seconds()), 0)
+        h, m = divmod(total // 60, 60)
+        phase2_eta = f"{h}h {m}m"
+
+    if last_bid_time and state["phase"] == 2:
+        delta = (last_bid_time + timedelta(hours=12)) - now
+        total = max(int(delta.total_seconds()), 0)
+        h, m = divmod(total // 60, 60)
+        close_eta = f"{h}h {m}m"
+
+    if paused:
+        phase2_eta = "Paused"
+        close_eta = "Paused"
+
+    pause_line = "Paused: **No**\n"
+
+    if paused:
+        pause_line = (
+            "Paused: **Yes**\n"
+            f"Pause Reason: **{pause_reason}**\n"
+        )
+
+    next_valid = state["current_bid"] + state["outbid_inc"]
+    phase1_bidders = state.get("phase1_bidders", set())
+    opted_out_bidders = state.get("opted_out_bidders", set())
+    bidder_count = len(phase1_bidders - opted_out_bidders)
+
+    await interaction.response.send_message(
+        f"📊 **Bid Status**\n"
+        f"Toon: **{state['current_toon']}**\n"
+        f"Current Bid: **{state['current_bid']:,}**\n"
+        f"Min Bid: **{state['min_bid']:,}**\n"
+        f"Min Outbid: **{state['outbid_inc']:,}**\n"
+        f"Next Valid Bid: **{next_valid:,}**\n"
+        f"Phase: **{phase_label(state['phase'])}**\n"
+        f"{pause_line}"
+        f"Eligible Phase 2 Bidders: **{bidder_count}**\n"
+        f"Phase 2 Starts In: **{phase2_eta}**\n"
+        f"Close In: **{close_eta}**",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="setminbid", description="Change the minimum bid for this thread"
+)
+@app_commands.describe(min_bid="Corrected minimum bid")
+async def setminbid(interaction: discord.Interaction, min_bid: int):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can adjust the minimum bid.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.", ephemeral=True
+        )
+        return
+
+    if min_bid < 0:
+        await interaction.response.send_message(
+            "Minimum bid cannot be negative.", ephemeral=True
+        )
+        return
+
+    state["min_bid"] = min_bid
+    state["outbid_inc"] = min_outbid_from_min_bid(min_bid)
+    save_state()
+
+    await interaction.response.send_message(
+        f"✏️ Min bid updated to **{min_bid:,}**. "
+        f"Min outbid is now **{state['outbid_inc']:,}**."
+    )
+
+@bot.tree.command(name="all_in", description="Bid all remaining EKP even if below normal min outbid")
+@app_commands.describe(
+    toon="The toon name you are bidding on",
+    amount="Your all-in bid amount"
+)
+async def all_in(interaction: discord.Interaction, toon: str, amount: int):
+    channel = interaction.channel
+
+    async def reply(message: str, ephemeral: bool = True):
+        if not interaction.response.is_done():
+            await interaction.response.send_message(message, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(message, ephemeral=ephemeral)
+
+    if not isinstance(channel, discord.Thread):
+        await reply("All-in bids must be placed inside a bid thread.")
+        return
+
+    if not is_allowed_channel(channel):
+        await reply("This is not a valid bidding channel.")
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await reply("No bid is open in this thread. Use `/open` first.")
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state["phase"] == 3 or state["closed"]:
+            await reply("🔒 Bidding is closed for this item.")
+            return
+
+        if state.get("paused"):
+            reason = state.get("pause_reason") or "Leadership review"
+
+            await reply(
+                f"⏸️ Bidding is currently paused.\n"
+                f"Reason: {reason}"
+            )
+            return
+
+        phase1_bidders = state.get("phase1_bidders", set())
+        if state["phase"] == 2 and interaction.user.id not in phase1_bidders:
+            await reply("⏰ Phase 2 is restricted to users who bid in the first 24 hours.")
+            return
+
+        if (
+            state["phase"] == 2
+            and interaction.user.id in state.get("opted_out_bidders", set())
+        ):
+            await reply(
+                "❌ You opted out during Phase 2 and cannot re-enter this bid."
+            )
+            return
+
+        user_bid_count = count_user_bids(state, interaction.user.id)
+        if user_bid_count >= 7:
+            await reply("❌ You have reached the maximum of 7 bids for this item.")
+            return
+
+        if amount < 0:
+            await reply("Bid cannot be negative.")
+            return
+
+        current = state["current_bid"]
+
+        if amount <= current:
+            await reply(f"All-in bid must still be higher than the current bid of **{current:,}**.")
+            return
+
+        now_str = utcnow().isoformat()
+        bid_number = len(state.get("bid_log", [])) + 1
+
+        state["current_bid"] = amount
+        state["current_toon"] = toon
+        state["current_bidder_id"] = interaction.user.id
+        state["last_bid_time"] = now_str
+
+        phase1_start = str_to_dt(state.get("phase1_start"))
+        if phase1_start and utcnow() <= phase1_start + timedelta(hours=24):
+            state["phase1_bidders"].add(interaction.user.id)
+
+            # A valid Phase 1 all-in rejoins someone who previously said "out".
+            state.setdefault("opted_out_bidders", set()).discard(interaction.user.id)
+
+        entry = {
+            "bid_number": bid_number,
+            "toon": toon,
+            "amount": amount,
+            "bidder_id": interaction.user.id,
+            "message_id": None,
+            "timestamp": now_str,
+            "valid": True,
+            "reason": "ALL IN",
+            "all_in": True,
+        }
+
+        state.setdefault("bid_log", []).append(entry)
+        state["last_valid_bid"] = entry
+
+        remaining = 7 - (user_bid_count + 1)
+
+        participants = state.get("phase1_bidders", set())
+        opted_out = state.get("opted_out_bidders", set())
+        mentions = " ".join(f"<@{uid}>" for uid in participants if uid not in opted_out)
+
+        await interaction.response.send_message(
+            f"🔥 **ALL IN Bid #{bid_number}!**\n"
+            f"__**{toon}**__ → {amount:,}\n"
+            f"Bids remaining: {remaining}\n"
+            f"{mentions}",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+        sent = await interaction.original_response()
+        state["bid_log"][-1]["message_id"] = sent.id
+        state["last_valid_bid"]["message_id"] = sent.id
+
+        save_state()
+
+@bot.tree.command(
+    name="correctbid",
+    description="Correct the amount, toon name, or both on a bid",
+)
+@app_commands.describe(
+    bid_number="The bid number to correct",
+    reason="Why the bid is being corrected",
+    amount="Corrected amount, if needed",
+    toon="Corrected toon name, if needed",
+)
+async def correctbid(
+    interaction: discord.Interaction,
+    bid_number: int,
+    reason: str,
+    amount: int | None = None,
+    toon: str | None = None,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(
+        interaction.user,
+        interaction.guild,
+    ):
+        await interaction.response.send_message(
+            "Only leaders can correct bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    if amount is None and toon is None:
+        await interaction.response.send_message(
+            "Enter a corrected `amount`, `toon`, or both.",
+            ephemeral=True,
+        )
+        return
+
+    if amount is not None and amount < 0:
+        await interaction.response.send_message(
+            "Corrected amount cannot be negative.",
+            ephemeral=True,
+        )
+        return
+
+    if toon is not None:
+        toon = toon.strip()
+
+        if not toon:
+            await interaction.response.send_message(
+                "Corrected toon name cannot be blank.",
+                ephemeral=True,
+            )
+            return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        bid_log = state.get("bid_log", [])
+        target_index = None
+
+        for index, entry in enumerate(bid_log):
+            if entry.get("bid_number") == bid_number:
+                target_index = index
+                break
+
+        if target_index is None:
+            await interaction.response.send_message(
+                f"No bid found with bid number **#{bid_number}**.",
+                ephemeral=True,
+            )
+            return
+
+        target = bid_log[target_index]
+
+        if not target.get("valid"):
+            await interaction.response.send_message(
+                f"Bid **#{bid_number}** is invalid and cannot be corrected.",
+                ephemeral=True,
+            )
+            return
+
+        old_amount = target["amount"]
+        old_toon = target["toon"]
+
+        amount_changed = amount is not None and amount != old_amount
+        toon_changed = toon is not None and toon != old_toon
+
+        if not amount_changed and not toon_changed:
+            await interaction.response.send_message(
+                "The corrected values are the same as the current bid.",
+                ephemeral=True,
+            )
+            return
+
+        if amount_changed:
+            previous_valid = None
+            next_valid = None
+
+            for entry in reversed(bid_log[:target_index]):
+                if entry.get("valid"):
+                    previous_valid = entry
+                    break
+
+            for entry in bid_log[target_index + 1:]:
+                if entry.get("valid"):
+                    next_valid = entry
+                    break
+
+            min_outbid = state["outbid_inc"]
+
+            if previous_valid:
+                minimum_allowed = previous_valid["amount"] + min_outbid
+            else:
+                minimum_allowed = state["min_bid"]
+
+            if amount < minimum_allowed:
+                await interaction.response.send_message(
+                    f"Corrected amount must be at least "
+                    f"**{minimum_allowed:,}**.",
+                    ephemeral=True,
+                )
+                return
+
+            if next_valid:
+                maximum_allowed = next_valid["amount"] - min_outbid
+
+                if amount > maximum_allowed:
+                    await interaction.response.send_message(
+                        f"Corrected amount cannot exceed "
+                        f"**{maximum_allowed:,}**, because the next valid bid "
+                        f"is **#{next_valid.get('bid_number')} — "
+                        f"{next_valid['amount']:,}**.",
+                        ephemeral=True,
+                    )
+                    return
+
+        corrections = target.setdefault("corrections", [])
+
+        correction_record = {
+            "reason": reason,
+            "corrected_by": interaction.user.id,
+            "timestamp": dt_to_str(utcnow()),
+        }
+
+        changes: list[str] = []
+
+        if amount_changed:
+            correction_record["old_amount"] = old_amount
+            correction_record["new_amount"] = amount
+
+            target["old_amount"] = old_amount
+            target["amount"] = amount
+
+            changes.append(
+                f"Amount: **{old_amount:,} → {amount:,}**"
+            )
+
+        if toon_changed:
+            correction_record["old_toon"] = old_toon
+            correction_record["new_toon"] = toon
+
+            target["old_toon"] = old_toon
+            target["toon"] = toon
+
+            changes.append(
+                f"Toon: **{old_toon} → {toon}**"
+            )
+
+        corrections.append(correction_record)
+
+        target["corrected"] = True
+        target["correction_reason"] = reason
+
+        recalc_last_valid_bid(state)
+        recalc_phase1_bidders(state)
+        save_state()
+
+        target_message_id = target.get("message_id")
+
+        if target_message_id:
+            try:
+                message = await channel.fetch_message(target_message_id)
+                await message.add_reaction("✏️")
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+                pass
+
+        new_last = state.get("last_valid_bid")
+
+        response_lines = [
+            f"✏️ Bid **#{bid_number}** corrected.",
+            *changes,
+            f"Reason: {reason}",
+        ]
+
+        if new_last:
+            response_lines.append(
+                f"Current valid bid: "
+                f"**{new_last['toon']} — {new_last['amount']:,}**"
+            )
+
+        await interaction.response.send_message(
+            "\n".join(response_lines)
+        )
+
+
+@bot.tree.command(
+    name="invalidate",
+    description="Invalidate one or more bids by bid number",
+)
+@app_commands.describe(
+    bid_numbers="Bid numbers, such as 2,4,7 or 2-5",
+    reason="Why these bids are being invalidated",
+)
+async def invalidate(
+    interaction: discord.Interaction,
+    bid_numbers: str,
+    reason: str,
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(
+        interaction.user,
+        interaction.guild,
+    ):
+        await interaction.response.send_message(
+            "Only leaders can invalidate bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        requested_numbers = parse_bid_numbers(bid_numbers)
+    except ValueError:
+        await interaction.response.send_message(
+            "Enter bid numbers like `2`, `2,4,7`, or `2-5`.",
+            ephemeral=True,
+        )
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        entries_by_number = {
+            entry.get("bid_number"): entry
+            for entry in state.get("bid_log", [])
+        }
+
+        invalidated: list[int] = []
+        already_invalid: list[int] = []
+        not_found: list[int] = []
+        message_ids: list[int] = []
+
+        for bid_number in requested_numbers:
+            target = entries_by_number.get(bid_number)
+
+            if target is None:
+                not_found.append(bid_number)
+                continue
+
+            if not target.get("valid"):
+                already_invalid.append(bid_number)
+                continue
+
+            target["valid"] = False
+            target["reason"] = f"Invalidated by leader: {reason}"
+            invalidated.append(bid_number)
+
+            if target.get("message_id"):
+                message_ids.append(target["message_id"])
+
+        if not invalidated:
+            details = []
+
+            if already_invalid:
+                details.append(
+                    "Already invalid: "
+                    + ", ".join(f"#{number}" for number in already_invalid)
+                )
+
+            if not_found:
+                details.append(
+                    "Not found: "
+                    + ", ".join(f"#{number}" for number in not_found)
+                )
+
+            await interaction.response.send_message(
+                "No bids were invalidated.\n" + "\n".join(details),
+                ephemeral=True,
+            )
+            return
+
+        recalc_last_valid_bid(state)
+        recalc_phase1_bidders(state)
+        save_state()
+
+        for message_id in message_ids:
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.add_reaction("❌")
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+                pass
+
+        lines = [
+            "❌ **Bids Invalidated**",
+            "Bids: " + ", ".join(f"**#{number}**" for number in invalidated),
+            f"Reason: {reason}",
+        ]
+
+        if already_invalid:
+            lines.append(
+                "Already invalid: "
+                + ", ".join(f"#{number}" for number in already_invalid)
+            )
+
+        if not_found:
+            lines.append(
+                "Not found: "
+                + ", ".join(f"#{number}" for number in not_found)
+            )
+
+        new_last = state.get("last_valid_bid")
+
+        if new_last:
+            lines.append(
+                f"Current valid bid: "
+                f"**{new_last['toon']} — {new_last['amount']:,}**"
+            )
+        else:
+            lines.append("There are no remaining valid bids.")
+
+        await interaction.response.send_message("\n".join(lines))
+
+
+
+@bot.tree.command(name="pausebid", description="Pause the current bid thread")
+@app_commands.describe(reason="Why this bid is being paused")
+async def pausebid(
+    interaction: discord.Interaction,
+    reason: str = "Leadership review",
+):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can pause bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state.get("closed") or state.get("phase") == 3:
+            await interaction.response.send_message(
+                "This bid is already closed.",
+                ephemeral=True,
+            )
+            return
+
+        if state.get("paused"):
+            await interaction.response.send_message(
+                "This bid is already paused.",
+                ephemeral=True,
+            )
+            return
+
+        reason = reason.strip() or "Leadership review"
+
+        state["paused"] = True
+        state["paused_at"] = dt_to_str(utcnow())
+        state["pause_reason"] = reason
+        state["paused_by"] = interaction.user.id
+
+        save_state()
+
+    await interaction.response.send_message(
+        f"⏸️ **Bidding Paused**\n"
+        f"Reason: {reason}\n\n"
+        "No new bids will be accepted, and phase timers will not progress until this bid is resumed.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="resumebid", description="Resume a paused bid thread")
+async def resumebid(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can resume bids.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+
+    if channel is None:
+        await interaction.response.send_message(
+            "Channel not found.",
+            ephemeral=True,
+        )
+        return
+
+    state = get_state(channel.id)
+
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.",
+            ephemeral=True,
+        )
+        return
+
+    lock = get_bid_lock(channel.id)
+
+    async with lock:
+        if state.get("closed") or state.get("phase") == 3:
+            await interaction.response.send_message(
+                "This bid is already closed.",
+                ephemeral=True,
+            )
+            return
+
+        if not state.get("paused"):
+            await interaction.response.send_message(
+                "This bid is not currently paused.",
+                ephemeral=True,
+            )
+            return
+
+        now = utcnow()
+        paused_at = str_to_dt(state.get("paused_at"))
+
+        paused_seconds = 0
+
+        if paused_at:
+            paused_seconds = max(
+                int((now - paused_at).total_seconds()),
+                0,
+            )
+
+            pause_duration = timedelta(seconds=paused_seconds)
+
+            # Move timers forward so paused time does not count
+            shift_bid_timers_after_pause(state, pause_duration)
+
+        state["paused"] = False
+        state["resumed_at"] = dt_to_str(now)
+        state["paused_at"] = None
+        state["resumed_by"] = interaction.user.id
+        state["total_paused_seconds"] = (
+            state.get("total_paused_seconds", 0) + paused_seconds
+        )
+
+        save_state()
+
+    minutes = paused_seconds // 60
+    hours, minutes = divmod(minutes, 60)
+
+    await interaction.response.send_message(
+        f"▶️ **Bidding Resumed**\n"
+        f"Paused time added back to timers: **{hours}h {minutes}m**\n\n"
+        "Bids are now open again.",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="closebid", description="Force close the current bid thread")
+async def closebid(interaction: discord.Interaction):
+    if not is_allowed_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Use this in bid channels only.", ephemeral=True
+        )
+        return
+
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can close bids.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Channel not found.", ephemeral=True)
+        return
+
+    state = get_state(channel.id)
+    if state is None:
+        await interaction.response.send_message(
+            "No open auction found in this thread.", ephemeral=True
+        )
+        return
+
+    state["phase"] = 3
+    state["closed"] = True
+    state["closed_announced"] = True
+    save_state()
+
+    last_valid = state.get("last_valid_bid")
+    if last_valid:
+        await interaction.response.send_message(
+            f"🔒 Bid closed manually.\n"
+            f"Final bid: **{last_valid['toon']} {last_valid['amount']:,}**\n"
+            f"Cash out with: `%pay {last_valid['toon']} {last_valid['amount']}`"
+        )
+    else:
+        await interaction.response.send_message(
+            "🔒 Bid closed manually. No valid bids recorded."
+        )
+
+
+@bot.tree.command(
+    name="fashionboard",
+    description="Post the editable Dhiothu fashion weapon tracker",
+)
+async def fashionboard(interaction: discord.Interaction):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders can post the fashion tracker.", ephemeral=True
+        )
+        return
+
+    if not fashion_state:
+        load_fashion_state()
+
+    await interaction.response.send_message(
+        embed=build_fashion_embed(),
+        view=FashionTrackerView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+bot.run(TOKEN)
