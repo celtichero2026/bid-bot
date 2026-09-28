@@ -2085,11 +2085,12 @@ async def record_roll_award(
                 channel = None
 
         if channel is not None:
+            # Keep the original closed-roll board as the permanent roll snapshot.
+            # Awarding only removes its management buttons; the winner is posted
+            # separately at the end of the thread below.
             try:
                 roll_message = await channel.fetch_message(roll_id)
                 await roll_message.edit(
-                    content=None,
-                    embed=build_awarded_roll_embed(state, roll_id),
                     view=None,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
@@ -2154,16 +2155,20 @@ async def process_award_return(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 channel = None
         if channel is not None:
-            try:
-                roll_message = await channel.fetch_message(roll_id)
-                await roll_message.edit(
-                    content=None,
-                    embed=build_awarded_roll_embed(state, roll_id),
-                    view=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+            # Preserve the original closed-roll board. Update the separate award
+            # message to show that the item was returned.
+            award_message_id = int(target_award.get("award_message_id", 0) or 0)
+            if award_message_id:
+                try:
+                    award_message = await channel.fetch_message(award_message_id)
+                    await award_message.edit(
+                        content=None,
+                        embed=build_awarded_roll_embed(state, roll_id),
+                        view=None,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
     item = discord.utils.escape_markdown(str(target_award.get("item", "Unknown item")))
     winner_id = int(target_award.get("winner_user_id", 0))
@@ -2208,16 +2213,20 @@ async def process_award_unreturn(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 channel = None
         if channel is not None:
-            try:
-                roll_message = await channel.fetch_message(roll_id)
-                await roll_message.edit(
-                    content=None,
-                    embed=build_awarded_roll_embed(state, roll_id),
-                    view=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+            # Restore the separate award message to Active. The original closed
+            # roll board remains untouched.
+            award_message_id = int(target_award.get("award_message_id", 0) or 0)
+            if award_message_id:
+                try:
+                    award_message = await channel.fetch_message(award_message_id)
+                    await award_message.edit(
+                        content=None,
+                        embed=build_awarded_roll_embed(state, roll_id),
+                        view=UndoAwardView(),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
     item = discord.utils.escape_markdown(str(target_award.get("item", "Unknown item")))
     winner_id = int(target_award.get("winner_user_id", 0))
