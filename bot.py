@@ -1300,22 +1300,23 @@ def build_roll_awards_embed(
         page_entries = entries[start:start + per_page]
 
         lines = []
-        for offset, entry in enumerate(page_entries, start=start + 1):
+        for entry in page_entries:
             item = discord.utils.escape_markdown(
                 str(entry.get("item", "Unknown item"))
             )
             winner_id = int(entry.get("winner_user_id", 0))
+            log_id = int(entry.get("log_id", 0) or 0)
 
             is_new = (
                 highlight_log_id is not None
-                and int(entry.get("log_id", 0) or 0) == highlight_log_id
+                and log_id == highlight_log_id
             )
             new_marker = " **← NEW**" if is_new else ""
 
             if member_id is not None:
-                lines.append(f"**{offset}.** {item}{new_marker}")
+                lines.append(f"**Award #{log_id}** — {item}{new_marker}")
             else:
-                lines.append(f"**{offset}.** {item} — <@{winner_id}>{new_marker}")
+                lines.append(f"**Award #{log_id}** — {item} — <@{winner_id}>{new_marker}")
 
         embed.add_field(
             name=f"Items ({total})",
@@ -1325,7 +1326,7 @@ def build_roll_awards_embed(
 
     footer = f"{total} current items • Page {page + 1}/{total_pages}"
     if member_id is not None and entries:
-        footer += " • Leaders: Refund / Return Item → enter list #"
+        footer += " • Leaders: use the Award # when returning an item"
     embed.set_footer(text=footer)
     return embed
 
@@ -2172,6 +2173,60 @@ async def process_award_return(
     embed = discord.Embed(title="↩️ Award Returned", description=f"**{item}**")
     embed.add_field(name="Award", value=f"#{log_id}", inline=True)
     embed.add_field(name="Previous holder", value=f"<@{winner_id}>", inline=True)
+    return embed
+
+
+async def process_award_unreturn(
+    guild: discord.Guild,
+    actor: discord.Member | discord.User,
+    target_award: dict,
+) -> discord.Embed:
+    """Reverse a mistaken return and restore the award to current ownership."""
+    if award_is_voided(target_award):
+        raise ValueError("That award was voided and cannot be restored as a return.")
+    if not award_is_returned(target_award):
+        raise ValueError("That award is not currently marked returned.")
+
+    target_award["returned"] = False
+    target_award["returned_at"] = None
+    target_award["returned_by_user_id"] = None
+    target_award["returned_by_name"] = None
+
+    roll_id = int(target_award.get("roll_id", 0) or 0)
+    state = get_roll_state(roll_id) if roll_id else None
+    if state is not None and int(state.get("award_log_id", 0) or 0) == int(target_award.get("log_id", 0) or 0):
+        state["award_returned"] = False
+        state["award_returned_at"] = None
+        state["award_returned_by"] = None
+
+    save_state()
+
+    if state is not None:
+        channel_id = state.get("channel_id")
+        channel = bot.get_channel(channel_id) if channel_id else None
+        if channel is None and channel_id:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+        if channel is not None:
+            try:
+                roll_message = await channel.fetch_message(roll_id)
+                await roll_message.edit(
+                    content=None,
+                    embed=build_awarded_roll_embed(state, roll_id),
+                    view=None,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    item = discord.utils.escape_markdown(str(target_award.get("item", "Unknown item")))
+    winner_id = int(target_award.get("winner_user_id", 0))
+    log_id = target_award.get("log_id", "?")
+    embed = discord.Embed(title="✅ Return Undone", description=f"**#{log_id} — {item}**")
+    embed.add_field(name="Restored holder", value=f"<@{winner_id}>", inline=True)
+    embed.add_field(name="Status", value="Active again", inline=True)
     return embed
 
 
@@ -3238,9 +3293,39 @@ async def undoaward(interaction: discord.Interaction, award_number: int):
     await slash_send(interaction, embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
+@bot.tree.command(name="undoreturn", description="Restore an award that was returned by mistake")
+@app_commands.describe(award_number="Actual Award # shown in /rollawards or /rollaudit")
+async def undoreturn(interaction: discord.Interaction, award_number: int):
+    if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
+        await slash_send(interaction, "Only leaders can undo returns.", ephemeral=True)
+        return
+
+    target = next(
+        (entry for entry in award_log
+         if int(entry.get("guild_id", 0)) == interaction.guild.id
+         and int(entry.get("log_id", 0)) == award_number),
+        None,
+    )
+    if target is None:
+        await slash_send(interaction, "That Award # was not found.", ephemeral=True)
+        return
+
+    try:
+        embed = await process_award_unreturn(interaction.guild, interaction.user, target)
+    except ValueError as exc:
+        await slash_send(interaction, str(exc), ephemeral=True)
+        return
+
+    await slash_send(
+        interaction,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 @bot.tree.command(name="returnaward", description="Mark a current roll award as returned")
 @app_commands.describe(
-    award_number="Exact award # from the audit",
+    award_number="Actual Award # shown in /rollawards or /rollaudit",
     member="Player whose current-item list you want to use",
     list_number="Item number shown by /rollawards for that player",
     item="Optional item-name match for that player",
