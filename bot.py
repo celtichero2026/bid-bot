@@ -1239,8 +1239,8 @@ def build_roll_awards_embed(
 ) -> discord.Embed:
     """Build the clean current-ownership embed used by /rollawards.
 
-    List numbers are stable within the current filtered result set so leaders can
-    use the Return Item button and enter the visible list number.
+    Current awards display their permanent Award # so return actions always target
+    the exact saved award rather than a page/list position.
     """
     total = len(entries)
     total_pages = max((total + per_page - 1) // per_page, 1)
@@ -1325,8 +1325,6 @@ def build_roll_awards_embed(
         )
 
     footer = f"{total} current items • Page {page + 1}/{total_pages}"
-    if member_id is not None and entries:
-        footer += " • Leaders: use the Award # when returning an item"
     embed.set_footer(text=footer)
     return embed
 
@@ -2286,50 +2284,49 @@ async def process_award_void(
     embed.add_field(name="Status", value="Voided • Roll is ready to award again", inline=False)
     return embed
 
-class RollAwardReturnModal(discord.ui.Modal, title="Return Roll Award"):
-    item_number = discord.ui.TextInput(
-        label="Item list number",
-        placeholder="Example: 2",
-        required=True,
-        max_length=4,
-    )
+class ReturnAwardSelect(discord.ui.Select):
+    def __init__(self, picker_view: "ReturnAwardPickerView", options: list[discord.SelectOption]):
+        super().__init__(
+            placeholder="Choose the item to return...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+        self.picker_view = picker_view
 
-    def __init__(self, awards_view: "RollAwardsView"):
-        super().__init__()
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            log_id = int(self.values[0])
+        except (ValueError, IndexError):
+            await interaction.response.edit_message(content="That award could not be selected.", view=None)
+            return
+        await self.picker_view.show_confirmation(interaction, log_id)
+
+
+class ConfirmReturnAwardView(discord.ui.View):
+    def __init__(self, awards_view: "RollAwardsView", log_id: int):
+        super().__init__(timeout=120)
         self.awards_view = awards_view
+        self.log_id = log_id
 
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.guild is None or not is_leader(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "Only leaders can return roll awards.",
-                ephemeral=True,
-            )
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and is_leader(interaction.user, interaction.guild):
+            return True
+        await interaction.response.send_message("Only leaders can return roll awards.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Confirm Return", emoji="↩️", style=discord.ButtonStyle.danger)
+    async def confirm_return(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.edit_message(content="Server not found.", view=None)
             return
 
-        raw_number = str(self.item_number.value).strip().lstrip("#")
-        if not raw_number.isdigit():
-            await interaction.response.send_message(
-                "Enter the number shown beside the item, like `2`.",
-                ephemeral=True,
-            )
-            return
-
-        list_number = int(raw_number)
-        if list_number < 1 or list_number > len(self.awards_view.entries):
-            await interaction.response.send_message(
-                f"Choose a list number from **1–{len(self.awards_view.entries)}**.",
-                ephemeral=True,
-            )
-            return
-
-        selected = self.awards_view.entries[list_number - 1]
-        log_id = int(selected.get("log_id", 0) or 0)
-        target_award = get_active_award_by_log_id(interaction.guild.id, log_id)
-
+        target_award = get_active_award_by_log_id(interaction.guild.id, self.log_id)
         if target_award is None:
-            await interaction.response.send_message(
-                "That item is no longer a current award. Run `/rollawards member:@Player` again to refresh the list.",
-                ephemeral=True,
+            await interaction.response.edit_message(
+                content="That item is no longer a current award. Refresh `/rollawards` and try again.",
+                view=None,
             )
             return
 
@@ -2340,14 +2337,13 @@ class RollAwardReturnModal(discord.ui.Modal, title="Return Roll Award"):
                 target_award,
             )
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.response.edit_message(content=str(exc), view=None)
             return
 
-        # Remove the returned item from this exact list so the embed refreshes immediately.
         self.awards_view.entries = [
             entry
             for entry in self.awards_view.entries
-            if int(entry.get("log_id", 0) or 0) != log_id
+            if int(entry.get("log_id", 0) or 0) != self.log_id
         ]
         self.awards_view.page = min(
             self.awards_view.page,
@@ -2355,9 +2351,10 @@ class RollAwardReturnModal(discord.ui.Modal, title="Return Roll Award"):
         )
         self.awards_view.update_buttons()
 
-        await interaction.response.send_message(
+        await interaction.response.edit_message(
+            content=None,
             embed=confirmation,
-            ephemeral=False,
+            view=None,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -2371,6 +2368,105 @@ class RollAwardReturnModal(discord.ui.Modal, title="Return Roll Award"):
                 )
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Return cancelled.", view=None)
+
+
+class ReturnAwardPickerView(discord.ui.View):
+    def __init__(self, awards_view: "RollAwardsView"):
+        super().__init__(timeout=300)
+        self.awards_view = awards_view
+        self.page = 0
+        self.per_page = 25
+        self.select: ReturnAwardSelect | None = None
+        self.rebuild_select()
+        self.update_buttons()
+
+    @property
+    def entries(self) -> list[dict]:
+        return self.awards_view.entries
+
+    @property
+    def total_pages(self) -> int:
+        return max((len(self.entries) + self.per_page - 1) // self.per_page, 1)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and is_leader(interaction.user, interaction.guild):
+            return True
+        await interaction.response.send_message("Only leaders can return roll awards.", ephemeral=True)
+        return False
+
+    def page_options(self) -> list[discord.SelectOption]:
+        start = self.page * self.per_page
+        rows = self.entries[start:start + self.per_page]
+        options = []
+        for entry in rows:
+            log_id = int(entry.get("log_id", 0) or 0)
+            item = str(entry.get("item", "Unknown item"))
+            label = f"Award #{log_id} — {item}"
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(log_id),
+                    description="Return this current award",
+                    emoji="↩️",
+                )
+            )
+        return options
+
+    def rebuild_select(self) -> None:
+        if self.select is not None:
+            self.remove_item(self.select)
+        options = self.page_options()
+        if options:
+            self.select = ReturnAwardSelect(self, options)
+            self.add_item(self.select)
+        else:
+            self.select = None
+
+    def update_buttons(self) -> None:
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.total_pages - 1
+
+    async def show_confirmation(self, interaction: discord.Interaction, log_id: int):
+        if interaction.guild is None:
+            await interaction.response.edit_message(content="Server not found.", view=None)
+            return
+        target = get_active_award_by_log_id(interaction.guild.id, log_id)
+        if target is None:
+            await interaction.response.edit_message(
+                content="That item is no longer a current award. Refresh `/rollawards` and try again.",
+                view=None,
+            )
+            return
+        item = discord.utils.escape_markdown(str(target.get("item", "Unknown item")))
+        await interaction.response.edit_message(
+            content=f"↩️ Return **Award #{log_id} — {item}**?",
+            view=ConfirmReturnAwardView(self.awards_view, log_id),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(self.page - 1, 0)
+        self.rebuild_select()
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=f"Choose the item to return. Page **{self.page + 1}/{self.total_pages}**.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Next", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.page + 1, self.total_pages - 1)
+        self.rebuild_select()
+        self.update_buttons()
+        await interaction.response.edit_message(
+            content=f"Choose the item to return. Page **{self.page + 1}/{self.total_pages}**.",
+            view=self,
+        )
 
 
 class RollAwardsView(discord.ui.View):
@@ -2503,7 +2599,24 @@ class RollAwardsView(discord.ui.View):
             )
             return
 
-        await interaction.response.send_modal(RollAwardReturnModal(self))
+        if len(self.entries) == 1:
+            entry = self.entries[0]
+            log_id = int(entry.get("log_id", 0) or 0)
+            item = discord.utils.escape_markdown(str(entry.get("item", "Unknown item")))
+            await interaction.response.send_message(
+                f"↩️ Return **Award #{log_id} — {item}**?",
+                view=ConfirmReturnAwardView(self, log_id),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        picker = ReturnAwardPickerView(self)
+        await interaction.response.send_message(
+            f"Choose the item to return. Page **1/{picker.total_pages}**.",
+            view=picker,
+            ephemeral=True,
+        )
 
 
 class RollAuditView(discord.ui.View):
