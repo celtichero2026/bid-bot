@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import traceback
 import random
 import secrets
@@ -3562,6 +3563,57 @@ async def returnaward(
 @bot.tree.command(name="ping")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
+
+
+@bot.tree.command(
+    name="testscore",
+    description="Test whether the score bot responds to a command sent by this bot",
+)
+@app_commands.describe(
+    toon="Toon name to look up",
+    score_channel="Channel where the score command should be sent",
+)
+async def testscore(
+    interaction: discord.Interaction,
+    toon: str,
+    score_channel: discord.TextChannel,
+):
+    toon = toon.strip()
+    if not toon:
+        await interaction.response.send_message(
+            "Enter a toon name.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Sending `%s {toon}` in {score_channel.mention}, then tagging you in 10 seconds.",
+        ephemeral=True,
+    )
+
+    try:
+        await score_channel.send(
+            f"%s {toon}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        await interaction.followup.send(
+            f"I couldn't send the score command in {score_channel.mention}: {exc}",
+            ephemeral=True,
+        )
+        return
+
+    await asyncio.sleep(10)
+
+    try:
+        await score_channel.send(
+            interaction.user.mention,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        await interaction.followup.send(
+            f"The score command was sent, but I couldn't tag you afterward: {exc}",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="open", description="Open a new bid thread")
