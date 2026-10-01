@@ -80,6 +80,15 @@ score_channel_id = SCORE_CHANNEL_ID
 SCORE_LOOKUP_DELAY_SECONDS = 3
 score_lookup_lock = Lock()
 
+# Scoreboard refresh integration.
+# This is separate from the per-toon score lookup channel above.
+SCOREBOARD_CHANNEL_ID = int(os.getenv("SCOREBOARD_CHANNEL_ID", "0") or 0)
+scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
+scoreboard_last_run: str | None = None
+SCOREBOARD_MIN_BID_TRIGGER = 500
+SCOREBOARD_COOLDOWN = timedelta(hours=1)
+scoreboard_refresh_lock = Lock()
+
 
 def is_leader(
     member: discord.Member | discord.User | None, guild: discord.Guild | None
@@ -297,6 +306,8 @@ def serialize_state() -> dict:
         "settings": {
             "bid_chat_censorship_enabled": bid_chat_censorship_enabled,
             "score_channel_id": score_channel_id,
+            "scoreboard_channel_id": scoreboard_channel_id,
+            "scoreboard_last_run": scoreboard_last_run,
         },
     }
 
@@ -309,7 +320,8 @@ def save_state() -> None:
 
 
 def load_state() -> None:
-    global bid_state, roll_state, award_log, bid_chat_censorship_enabled, score_channel_id
+    global bid_state, roll_state, award_log, bid_chat_censorship_enabled
+    global score_channel_id, scoreboard_channel_id, scoreboard_last_run
 
     ensure_data_dir()
 
@@ -319,6 +331,8 @@ def load_state() -> None:
         award_log = []
         bid_chat_censorship_enabled = True
         score_channel_id = SCORE_CHANNEL_ID
+        scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
+        scoreboard_last_run = None
         return
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -337,9 +351,15 @@ def load_state() -> None:
                 settings.get("bid_chat_censorship_enabled", True)
             )
             score_channel_id = int(settings.get("score_channel_id", SCORE_CHANNEL_ID) or 0)
+            scoreboard_channel_id = int(
+                settings.get("scoreboard_channel_id", SCOREBOARD_CHANNEL_ID) or 0
+            )
+            scoreboard_last_run = settings.get("scoreboard_last_run")
         else:
             bid_chat_censorship_enabled = True
             score_channel_id = SCORE_CHANNEL_ID
+            scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
+            scoreboard_last_run = None
         return
 
     # Old format fallback — protects your original live bid_state.json.
@@ -348,6 +368,8 @@ def load_state() -> None:
     award_log = []
     bid_chat_censorship_enabled = True
     score_channel_id = SCORE_CHANNEL_ID
+    scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
+    scoreboard_last_run = None
 
 
 def get_state(thread_id: int) -> dict | None:
@@ -663,6 +685,76 @@ async def run_score_lookup(
             )
         except (discord.Forbidden, discord.HTTPException) as exc:
             print(f"[SCORE LOOKUP] Could not tag bidder: {exc}")
+
+
+
+async def get_scoreboard_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Resolve the separately configured channel used for %sb page refreshes."""
+    if not scoreboard_channel_id:
+        return None
+
+    channel = guild.get_channel(scoreboard_channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+
+    try:
+        fetched = await bot.fetch_channel(scoreboard_channel_id)
+        if isinstance(fetched, discord.TextChannel):
+            return fetched
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    return None
+
+
+async def maybe_refresh_scoreboard(
+    guild: discord.Guild,
+    min_bid: int,
+) -> None:
+    """
+    Refresh RikBot scoreboard pages 1-5 when a qualifying bid opens.
+
+    - opening min bid must be 500+
+    - only one refresh per hour
+    - last-run time is persisted so restarts do not reset the cooldown
+    """
+    global scoreboard_last_run
+
+    if min_bid < SCOREBOARD_MIN_BID_TRIGGER:
+        return
+
+    async with scoreboard_refresh_lock:
+        now = utcnow()
+        last_run = str_to_dt(scoreboard_last_run)
+
+        if last_run is not None and now - last_run < SCOREBOARD_COOLDOWN:
+            return
+
+        scoreboard_channel = await get_scoreboard_channel(guild)
+        if scoreboard_channel is None:
+            print(
+                "[SCOREBOARD REFRESH] No valid scoreboard channel configured. "
+                "Use /setscoreboardchannel to choose one."
+            )
+            return
+
+        # Claim the cooldown before sending so simultaneous /open commands
+        # cannot both trigger the refresh.
+        scoreboard_last_run = dt_to_str(now)
+        save_state()
+
+        for page in range(1, 6):
+            try:
+                await scoreboard_channel.send(
+                    f"%sb p{page}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"[SCOREBOARD REFRESH] Could not send page {page}: {exc}")
+                return
+
+            if page < 5:
+                await asyncio.sleep(1)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3815,6 +3907,47 @@ async def set_score_channel(
 
 
 @bot.tree.command(
+    name="setscoreboardchannel",
+    description="Set the channel used for RikBot scoreboard page refreshes",
+)
+@app_commands.describe(
+    channel="Channel where %sb p1 through %sb p5 should be posted"
+)
+async def set_scoreboard_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    global scoreboard_channel_id
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    is_admin = (
+        isinstance(member, discord.Member)
+        and member.guild_permissions.administrator
+    )
+    if not is_admin and not is_leader(member, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders/admins can change the scoreboard channel.",
+            ephemeral=True,
+        )
+        return
+
+    scoreboard_channel_id = channel.id
+    save_state()
+
+    await interaction.response.send_message(
+        f"✅ Scoreboard refreshes will now use {channel.mention}.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="commitments",
     description="Show EKP currently committed to winning open bids",
 )
@@ -3963,6 +4096,12 @@ async def open_bid(
                 interaction.guild,
                 toon,
                 interaction.user.id,
+            )
+        )
+        asyncio.create_task(
+            maybe_refresh_scoreboard(
+                interaction.guild,
+                min_bid,
             )
         )
 
