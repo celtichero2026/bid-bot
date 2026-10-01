@@ -89,6 +89,11 @@ SCOREBOARD_MIN_BID_TRIGGER = 500
 SCOREBOARD_COOLDOWN = timedelta(hours=1)
 scoreboard_refresh_lock = Lock()
 
+# Min-bid chart reference shown on successful /open posts.
+# Leaders/admins configure this with /setminbidchart.
+MIN_BID_CHART_URL = os.getenv("MIN_BID_CHART_URL", "").strip()
+min_bid_chart_url = MIN_BID_CHART_URL
+
 
 def is_leader(
     member: discord.Member | discord.User | None, guild: discord.Guild | None
@@ -308,6 +313,7 @@ def serialize_state() -> dict:
             "score_channel_id": score_channel_id,
             "scoreboard_channel_id": scoreboard_channel_id,
             "scoreboard_last_run": scoreboard_last_run,
+            "min_bid_chart_url": min_bid_chart_url,
         },
     }
 
@@ -322,6 +328,7 @@ def save_state() -> None:
 def load_state() -> None:
     global bid_state, roll_state, award_log, bid_chat_censorship_enabled
     global score_channel_id, scoreboard_channel_id, scoreboard_last_run
+    global min_bid_chart_url
 
     ensure_data_dir()
 
@@ -333,6 +340,7 @@ def load_state() -> None:
         score_channel_id = SCORE_CHANNEL_ID
         scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
         scoreboard_last_run = None
+        min_bid_chart_url = MIN_BID_CHART_URL
         return
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -355,11 +363,15 @@ def load_state() -> None:
                 settings.get("scoreboard_channel_id", SCOREBOARD_CHANNEL_ID) or 0
             )
             scoreboard_last_run = settings.get("scoreboard_last_run")
+            min_bid_chart_url = str(
+                settings.get("min_bid_chart_url", MIN_BID_CHART_URL) or ""
+            ).strip()
         else:
             bid_chat_censorship_enabled = True
             score_channel_id = SCORE_CHANNEL_ID
             scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
             scoreboard_last_run = None
+            min_bid_chart_url = MIN_BID_CHART_URL
         return
 
     # Old format fallback — protects your original live bid_state.json.
@@ -370,6 +382,7 @@ def load_state() -> None:
     score_channel_id = SCORE_CHANNEL_ID
     scoreboard_channel_id = SCOREBOARD_CHANNEL_ID
     scoreboard_last_run = None
+    min_bid_chart_url = MIN_BID_CHART_URL
 
 
 def get_state(thread_id: int) -> dict | None:
@@ -3948,6 +3961,61 @@ async def set_scoreboard_channel(
 
 
 @bot.tree.command(
+    name="setminbidchart",
+    description="Set the Discord message link used to verify minimum bids",
+)
+@app_commands.describe(
+    message_link="Discord message link containing the current minimum-bid chart"
+)
+async def set_min_bid_chart(
+    interaction: discord.Interaction,
+    message_link: str,
+):
+    global min_bid_chart_url
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    is_admin = (
+        isinstance(member, discord.Member)
+        and member.guild_permissions.administrator
+    )
+    if not is_admin and not is_leader(member, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders/admins can change the minimum-bid chart link.",
+            ephemeral=True,
+        )
+        return
+
+    link = message_link.strip().strip("<>")
+    allowed_prefixes = (
+        "https://discord.com/channels/",
+        "https://ptb.discord.com/channels/",
+        "https://canary.discord.com/channels/",
+        "https://discordapp.com/channels/",
+    )
+    if not link.startswith(allowed_prefixes):
+        await interaction.response.send_message(
+            "Paste the Discord **Copy Message Link** for the message containing the minimum-bid chart.",
+            ephemeral=True,
+        )
+        return
+
+    min_bid_chart_url = link
+    save_state()
+
+    await interaction.response.send_message(
+        "✅ Minimum-bid chart link saved. New `/open` posts will include the verification link.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="commitments",
     description="Show EKP currently committed to winning open bids",
 )
@@ -4063,9 +4131,17 @@ async def open_bid(
 
     outbid_inc = min_outbid_from_min_bid(min_bid)
 
-    await interaction.response.send_message(
-        f"✅ Bid opened\n"
+    open_lines = [
+        "✅ Bid opened",
         f"{toon} {amount:,} | Min bid: {min_bid:,} | Min outbid: {outbid_inc:,}",
+    ]
+    if min_bid_chart_url:
+        open_lines.append(
+            f"🔎 **Verify minimum bid:** [View Min Bid Chart]({min_bid_chart_url})"
+        )
+
+    await interaction.response.send_message(
+        "\n".join(open_lines),
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
