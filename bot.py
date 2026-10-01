@@ -73,9 +73,10 @@ roll_locks: dict[int, Lock] = {}
 bid_chat_censorship_enabled = True
 
 # EKP score lookup integration.
-# If SCORE_CHANNEL_ID is not set, the bot will try to find a text channel with
-# a common score/EKP-score name automatically.
+# SCORE_CHANNEL_ID can still provide a startup default, but /setscorechannel
+# saves the live channel choice into bid_state.json and takes priority.
 SCORE_CHANNEL_ID = int(os.getenv("SCORE_CHANNEL_ID", "0") or 0)
+score_channel_id = SCORE_CHANNEL_ID
 SCORE_LOOKUP_DELAY_SECONDS = 3
 score_lookup_lock = Lock()
 
@@ -295,6 +296,7 @@ def serialize_state() -> dict:
         "award_log": award_log,
         "settings": {
             "bid_chat_censorship_enabled": bid_chat_censorship_enabled,
+            "score_channel_id": score_channel_id,
         },
     }
 
@@ -307,7 +309,7 @@ def save_state() -> None:
 
 
 def load_state() -> None:
-    global bid_state, roll_state, award_log, bid_chat_censorship_enabled
+    global bid_state, roll_state, award_log, bid_chat_censorship_enabled, score_channel_id
 
     ensure_data_dir()
 
@@ -316,6 +318,7 @@ def load_state() -> None:
         roll_state = {}
         award_log = []
         bid_chat_censorship_enabled = True
+        score_channel_id = SCORE_CHANNEL_ID
         return
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -333,8 +336,10 @@ def load_state() -> None:
             bid_chat_censorship_enabled = bool(
                 settings.get("bid_chat_censorship_enabled", True)
             )
+            score_channel_id = int(settings.get("score_channel_id", SCORE_CHANNEL_ID) or 0)
         else:
             bid_chat_censorship_enabled = True
+            score_channel_id = SCORE_CHANNEL_ID
         return
 
     # Old format fallback — protects your original live bid_state.json.
@@ -342,6 +347,7 @@ def load_state() -> None:
     roll_state = {}
     award_log = []
     bid_chat_censorship_enabled = True
+    score_channel_id = SCORE_CHANNEL_ID
 
 
 def get_state(thread_id: int) -> dict | None:
@@ -505,39 +511,20 @@ def _score_reply_looks_failed(message: discord.Message) -> bool:
 
 
 async def get_score_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    """Resolve the channel used for %s EKP lookups."""
-    if SCORE_CHANNEL_ID:
-        channel = guild.get_channel(SCORE_CHANNEL_ID)
+    """Resolve the admin-configured channel used for %s EKP lookups."""
+    if not score_channel_id:
+        return None
 
-        if isinstance(channel, discord.TextChannel):
-            return channel
+    channel = guild.get_channel(score_channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
 
-        try:
-            fetched = await bot.fetch_channel(SCORE_CHANNEL_ID)
-            if isinstance(fetched, discord.TextChannel):
-                return fetched
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-
-    exact_names = {
-        "score",
-        "scores",
-        "ekp-score",
-        "ekp-scores",
-        "ekp_score",
-        "ekp_scores",
-        "score-check",
-        "score_check",
-    }
-
-    for channel in guild.text_channels:
-        if channel.name.casefold() in exact_names:
-            return channel
-
-    for channel in guild.text_channels:
-        name = channel.name.casefold()
-        if "score" in name and "ekp" in name:
-            return channel
+    try:
+        fetched = await bot.fetch_channel(score_channel_id)
+        if isinstance(fetched, discord.TextChannel):
+            return fetched
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
 
     return None
 
@@ -559,8 +546,8 @@ async def run_score_lookup(
     score_channel = await get_score_channel(guild)
     if score_channel is None:
         print(
-            "[SCORE LOOKUP] No score channel found. "
-            "Set SCORE_CHANNEL_ID or use a recognizable score channel name."
+            "[SCORE LOOKUP] No valid score channel configured. "
+            "Use /setscorechannel to choose one."
         )
         return
 
@@ -3727,6 +3714,42 @@ async def returnaward(
 @bot.tree.command(name="ping")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
+
+
+@bot.tree.command(
+    name="setscorechannel",
+    description="Set the channel used for EKP score checks",
+)
+@app_commands.describe(channel="Channel where RikBot score checks should be posted")
+async def set_score_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    global score_channel_id
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    is_admin = isinstance(member, discord.Member) and member.guild_permissions.administrator
+    if not is_admin and not is_leader(member, interaction.guild):
+        await interaction.response.send_message(
+            "Only leaders/admins can change the score-check channel.",
+            ephemeral=True,
+        )
+        return
+
+    score_channel_id = channel.id
+    save_state()
+
+    await interaction.response.send_message(
+        f"✅ EKP score checks will now use {channel.mention}.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="open", description="Open a new bid thread")
