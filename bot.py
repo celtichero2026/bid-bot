@@ -369,11 +369,13 @@ def init_state(
     min_bid: int,
     bidder_id: int,
     message_id: int | None,
+    guild_id: int | None = None,
 ) -> dict:
     now = utcnow()
     outbid_inc = min_outbid_from_min_bid(min_bid)
 
     state = {
+        "guild_id": guild_id,
         "phase": 1,
         "phase1_start": dt_to_str(now),
         "last_bid_time": dt_to_str(now),
@@ -464,6 +466,66 @@ def recalc_phase1_bidders(state: dict) -> None:
             valid_bidders.add(entry["bidder_id"])
 
     state["phase1_bidders"] = valid_bidders
+
+
+def get_active_commitments(
+    user_id: int,
+    guild_id: int | None = None,
+) -> list[dict]:
+    """Return this Discord user's current winning EKP commitments.
+
+    Commitments are derived live from open bid states instead of stored as a
+    separate running balance. That means an outbid, close, correction, or
+    invalidation automatically releases/recalculates EKP.
+    """
+    commitments: list[dict] = []
+
+    for thread_id, state in bid_state.items():
+        if state.get("closed") or state.get("phase") == 3:
+            continue
+
+        state_guild_id = state.get("guild_id")
+        if (
+            guild_id is not None
+            and state_guild_id is not None
+            and int(state_guild_id) != int(guild_id)
+        ):
+            continue
+
+        if int(state.get("current_bidder_id", 0) or 0) != int(user_id):
+            continue
+
+        amount = int(state.get("current_bid", 0) or 0)
+        if amount <= 0:
+            continue
+
+        commitments.append(
+            {
+                "thread_id": int(thread_id),
+                "toon": str(state.get("current_toon", "Unknown")),
+                "amount": amount,
+                "phase": int(state.get("phase", 0) or 0),
+                "paused": bool(state.get("paused", False)),
+            }
+        )
+
+    return sorted(commitments, key=lambda item: item["amount"], reverse=True)
+
+
+def get_committed_ekp(user_id: int, guild_id: int | None = None) -> int:
+    return sum(
+        entry["amount"]
+        for entry in get_active_commitments(user_id, guild_id=guild_id)
+    )
+
+
+def _commitment_snapshot_text(user_id: int, guild_id: int | None = None) -> str:
+    commitments = get_active_commitments(user_id, guild_id=guild_id)
+    total = sum(entry["amount"] for entry in commitments)
+    count = len(commitments)
+    noun = "bid" if count == 1 else "bids"
+    return f"💰 You currently have **{total:,} EKP** committed across **{count}** open {noun}."
+
 
 def _message_search_text(message: discord.Message) -> str:
     """Flatten message/embed text so RikBot success/failure replies can be checked."""
@@ -3752,6 +3814,78 @@ async def set_score_channel(
     )
 
 
+@bot.tree.command(
+    name="commitments",
+    description="Show EKP currently committed to winning open bids",
+)
+@app_commands.describe(
+    member="Player to review (leave blank to check yourself)",
+)
+async def commitments(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    target = member or interaction.user
+
+    if target.id != interaction.user.id:
+        caller = interaction.user
+        is_admin = (
+            isinstance(caller, discord.Member)
+            and caller.guild_permissions.administrator
+        )
+        if not is_admin and not is_leader(caller, interaction.guild):
+            await interaction.response.send_message(
+                "Only leaders/admins can review another player's commitments.",
+                ephemeral=True,
+            )
+            return
+
+    active = get_active_commitments(target.id, guild_id=interaction.guild.id)
+    total = sum(entry["amount"] for entry in active)
+
+    display_name = discord.utils.escape_markdown(
+        getattr(target, "display_name", None)
+        or getattr(target, "name", "Unknown")
+    )
+
+    lines = [
+        f"💰 **EKP Commitments — {display_name}**",
+        f"Total committed: **{total:,} EKP**",
+        f"Open winning bids: **{len(active)}**",
+    ]
+
+    if active:
+        lines.append("")
+        for entry in active:
+            paused = " • paused" if entry.get("paused") else ""
+            toon = discord.utils.escape_markdown(entry["toon"])
+            lines.append(
+                f"• <#{entry['thread_id']}> — **{toon}** — **{entry['amount']:,}**{paused}"
+            )
+    else:
+        lines.extend(["", "No EKP is currently committed to an open winning bid."])
+
+    lines.extend(
+        [
+            "",
+            "*Live commitments only. Exact EKP available when a bid opened is still reviewed manually when needed.*",
+        ]
+    )
+
+    await interaction.response.send_message(
+        "\n".join(lines),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 @bot.tree.command(name="open", description="Open a new bid thread")
 @app_commands.describe(
     toon="The toon name for the opening bid",
@@ -3811,8 +3945,17 @@ async def open_bid(
         min_bid=min_bid,
         bidder_id=interaction.user.id,
         message_id=sent.id,
+        guild_id=interaction.guild.id if interaction.guild is not None else None,
     )
     save_state()
+
+    await interaction.followup.send(
+        _commitment_snapshot_text(
+            interaction.user.id,
+            guild_id=interaction.guild.id if interaction.guild is not None else None,
+        ),
+        ephemeral=True,
+    )
 
     if interaction.guild is not None:
         asyncio.create_task(
@@ -3986,6 +4129,14 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
 
         save_state()
 
+        await interaction.followup.send(
+            _commitment_snapshot_text(
+                interaction.user.id,
+                guild_id=interaction.guild.id if interaction.guild is not None else None,
+            ),
+            ephemeral=True,
+        )
+
         if first_entry_in_thread and interaction.guild is not None:
             asyncio.create_task(
                 run_score_lookup(
@@ -4135,10 +4286,18 @@ async def bidinfo(interaction: discord.Interaction):
     opted_out_bidders = state.get("opted_out_bidders", set())
     bidder_count = len(phase1_bidders - opted_out_bidders)
 
+    current_winner_id = int(state.get("current_bidder_id", 0) or 0)
+    winner_commitments = get_active_commitments(
+        current_winner_id,
+        guild_id=interaction.guild.id if interaction.guild is not None else None,
+    ) if current_winner_id else []
+    winner_committed_total = sum(entry["amount"] for entry in winner_commitments)
+
     await interaction.response.send_message(
         f"📊 **Bid Status**\n"
         f"Toon: **{state['current_toon']}**\n"
         f"Current Bid: **{state['current_bid']:,}**\n"
+        f"Winner's Open Commitments: **{winner_committed_total:,} EKP across {len(winner_commitments)} bid(s)**\n"
         f"Min Bid: **{state['min_bid']:,}**\n"
         f"Min Outbid: **{state['outbid_inc']:,}**\n"
         f"Next Valid Bid: **{next_valid:,}**\n"
@@ -4316,6 +4475,14 @@ async def all_in(interaction: discord.Interaction, toon: str, amount: int):
         state["last_valid_bid"]["message_id"] = sent.id
 
         save_state()
+
+        await interaction.followup.send(
+            _commitment_snapshot_text(
+                interaction.user.id,
+                guild_id=interaction.guild.id if interaction.guild is not None else None,
+            ),
+            ephemeral=True,
+        )
 
 @bot.tree.command(
     name="correctbid",
