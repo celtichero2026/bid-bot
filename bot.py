@@ -770,6 +770,102 @@ async def maybe_refresh_scoreboard(
                 await asyncio.sleep(1)
 
 
+MIN_BID_CHART_BUTTON_ID = "bidbot_min_bid_chart"
+MIN_BID_CHART_LINK_RE = re.compile(
+    r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)$"
+)
+
+
+def parse_min_bid_chart_message_link(message_link: str) -> tuple[int, int, int] | None:
+    """Parse a Discord message link into guild/channel/message IDs."""
+    match = MIN_BID_CHART_LINK_RE.match((message_link or "").strip().strip("<>"))
+    if not match:
+        return None
+    return tuple(int(value) for value in match.groups())
+
+
+async def get_min_bid_chart_image_url(message_link: str) -> tuple[str | None, str | None]:
+    """Resolve the configured Discord message to an image URL."""
+    parsed = parse_min_bid_chart_message_link(message_link)
+    if parsed is None:
+        return None, "The saved minimum-bid chart link is not a valid Discord message link."
+
+    _guild_id, channel_id, message_id = parsed
+    channel = bot.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None, "I can't access the channel containing the minimum-bid chart."
+
+    if not hasattr(channel, "fetch_message"):
+        return None, "The saved minimum-bid chart location is not a message channel."
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None, "I can't access the saved minimum-bid chart message."
+
+    image_extensions = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    for attachment in message.attachments:
+        content_type = (attachment.content_type or "").casefold()
+        filename = (attachment.filename or "").casefold()
+        if content_type.startswith("image/") or filename.endswith(image_extensions):
+            return attachment.url, None
+
+    for embed in message.embeds:
+        if embed.image and embed.image.url:
+            return embed.image.url, None
+        if embed.thumbnail and embed.thumbnail.url:
+            return embed.thumbnail.url, None
+
+    return None, "The saved message doesn't contain an image."
+
+
+class MinBidChartView(discord.ui.View):
+    """Persistent button that shows the min-bid chart without leaving the bid thread."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="View Min Bid Chart",
+        emoji="🔎",
+        style=discord.ButtonStyle.secondary,
+        custom_id=MIN_BID_CHART_BUTTON_ID,
+    )
+    async def view_chart(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not min_bid_chart_url:
+            await interaction.response.send_message(
+                "No minimum-bid chart is currently configured.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        image_url, error = await get_min_bid_chart_image_url(min_bid_chart_url)
+
+        if image_url is None:
+            await interaction.followup.send(
+                f"⚠️ {error or 'I could not load the minimum-bid chart.'}",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(title="🔎 Minimum Bid Chart")
+        embed.set_image(url=image_url)
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Dhio fashion tracker
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3048,6 +3144,7 @@ async def on_ready():
         bot.add_view(ClosedRollView())
         bot.add_view(UndoAwardView())
         bot.add_view(FashionTrackerView())
+        bot.add_view(MinBidChartView())
         roll_views_registered = True
 
     await bot.tree.sync()
@@ -3993,15 +4090,27 @@ async def set_min_bid_chart(
         return
 
     link = message_link.strip().strip("<>")
-    allowed_prefixes = (
-        "https://discord.com/channels/",
-        "https://ptb.discord.com/channels/",
-        "https://canary.discord.com/channels/",
-        "https://discordapp.com/channels/",
-    )
-    if not link.startswith(allowed_prefixes):
+    parsed = parse_min_bid_chart_message_link(link)
+    if parsed is None:
         await interaction.response.send_message(
             "Paste the Discord **Copy Message Link** for the message containing the minimum-bid chart.",
+            ephemeral=True,
+        )
+        return
+
+    link_guild_id, _, _ = parsed
+    if link_guild_id != interaction.guild.id:
+        await interaction.response.send_message(
+            "The minimum-bid chart message needs to be in this server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    image_url, error = await get_min_bid_chart_image_url(link)
+    if image_url is None:
+        await interaction.followup.send(
+            f"⚠️ {error or 'I could not find an image in that message.'}",
             ephemeral=True,
         )
         return
@@ -4009,9 +4118,15 @@ async def set_min_bid_chart(
     min_bid_chart_url = link
     save_state()
 
-    await interaction.response.send_message(
-        "✅ Minimum-bid chart link saved. New `/open` posts will include the verification link.",
+    preview = discord.Embed(
+        title="✅ Minimum-bid chart saved",
+        description="New `/open` posts will include a **View Min Bid Chart** button.",
+    )
+    preview.set_image(url=image_url)
+    await interaction.followup.send(
+        embed=preview,
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -4135,13 +4250,14 @@ async def open_bid(
         "✅ Bid opened",
         f"{toon} {amount:,} | Min bid: {min_bid:,} | Min outbid: {outbid_inc:,}",
     ]
+    chart_view = None
     if min_bid_chart_url:
-        open_lines.append(
-            f"🔎 **Verify minimum bid:** [View Min Bid Chart]({min_bid_chart_url})"
-        )
+        open_lines.append("🔎 **Verify minimum bid:**")
+        chart_view = MinBidChartView()
 
     await interaction.response.send_message(
         "\n".join(open_lines),
+        view=chart_view,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
