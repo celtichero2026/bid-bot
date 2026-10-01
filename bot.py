@@ -84,7 +84,12 @@ bid_chat_censorship_enabled = True
 SCORE_CHANNEL_ID = int(os.getenv("SCORE_CHANNEL_ID", "0") or 0)
 score_channel_id = SCORE_CHANNEL_ID
 SCORE_LOOKUP_DELAY_SECONDS = 3
+SCORE_LOOKUP_COOLDOWN = timedelta(minutes=20)
 score_lookup_lock = Lock()
+# Prevent repeated RikBot lookups when the same Discord user bids the same toon
+# across several threads in a short period. This is intentionally in-memory only;
+# a bot restart clears the cooldown.
+score_lookup_last_run: dict[tuple[int, int, str], datetime] = {}
 
 # Scoreboard refresh integration.
 # This is separate from the per-toon score lookup channel above.
@@ -640,7 +645,8 @@ async def run_score_lookup(
     """
     Ask RikBot for the toon score, wait up to 3 seconds for another bot's reply,
     then tag the Discord user who entered the bid. Lookups are serialized so
-    simultaneous bids cannot steal each other's RikBot responses.
+    simultaneous bids cannot steal each other's RikBot responses. The same
+    Discord user + toon combination is checked at most once every 20 minutes.
     """
     toon = toon.strip()
     if not toon:
@@ -655,6 +661,28 @@ async def run_score_lookup(
         return
 
     async with score_lookup_lock:
+        now = utcnow()
+        cooldown_key = (guild.id, bidder_id, toon.casefold())
+        last_lookup = score_lookup_last_run.get(cooldown_key)
+
+        if last_lookup is not None and now - last_lookup < SCORE_LOOKUP_COOLDOWN:
+            remaining = SCORE_LOOKUP_COOLDOWN - (now - last_lookup)
+            remaining_minutes = max(1, int((remaining.total_seconds() + 59) // 60))
+            print(
+                f"[SCORE LOOKUP] Skipped duplicate lookup for {toon} / {bidder_id}; "
+                f"cooldown has about {remaining_minutes}m remaining."
+            )
+            return
+
+        # Drop expired entries so this tiny cache does not grow forever.
+        expired_keys = [
+            key
+            for key, checked_at in score_lookup_last_run.items()
+            if now - checked_at >= SCORE_LOOKUP_COOLDOWN
+        ]
+        for key in expired_keys:
+            score_lookup_last_run.pop(key, None)
+
         started = asyncio.get_running_loop().time()
 
         def check(message: discord.Message) -> bool:
@@ -673,6 +701,9 @@ async def run_score_lookup(
         except (discord.Forbidden, discord.HTTPException) as exc:
             print(f"[SCORE LOOKUP] Could not send score command: {exc}")
             return
+
+        # Start the cooldown only after the lookup command was successfully sent.
+        score_lookup_last_run[cooldown_key] = utcnow()
 
         response = None
         try:
