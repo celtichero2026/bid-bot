@@ -689,7 +689,7 @@ async def run_score_lookup(
 
 
 async def get_scoreboard_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    """Resolve the separately configured channel used for %sb page refreshes."""
+    """Resolve the separately configured channel used for %lt page refreshes."""
     if not scoreboard_channel_id:
         return None
 
@@ -746,7 +746,7 @@ async def maybe_refresh_scoreboard(
         for page in range(1, 6):
             try:
                 await scoreboard_channel.send(
-                    f"%sb p{page}",
+                    f"%lt p{page}",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except (discord.Forbidden, discord.HTTPException) as exc:
@@ -3911,7 +3911,7 @@ async def set_score_channel(
     description="Set the channel used for RikBot scoreboard page refreshes",
 )
 @app_commands.describe(
-    channel="Channel where %sb p1 through %sb p5 should be posted"
+    channel="Channel where %lt p1 through %lt p5 should be posted"
 )
 async def set_scoreboard_channel(
     interaction: discord.Interaction,
