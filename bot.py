@@ -72,6 +72,13 @@ roll_locks: dict[int, Lock] = {}
 # False = people can chat normally in bid threads.
 bid_chat_censorship_enabled = True
 
+# EKP score lookup integration.
+# If SCORE_CHANNEL_ID is not set, the bot will try to find a text channel with
+# a common score/EKP-score name automatically.
+SCORE_CHANNEL_ID = int(os.getenv("SCORE_CHANNEL_ID", "0") or 0)
+SCORE_LOOKUP_DELAY_SECONDS = 3
+score_lookup_lock = Lock()
+
 
 def is_leader(
     member: discord.Member | discord.User | None, guild: discord.Guild | None
@@ -451,6 +458,163 @@ def recalc_phase1_bidders(state: dict) -> None:
             valid_bidders.add(entry["bidder_id"])
 
     state["phase1_bidders"] = valid_bidders
+
+def _message_search_text(message: discord.Message) -> str:
+    """Flatten message/embed text so RikBot success/failure replies can be checked."""
+    parts = [message.content or ""]
+
+    for embed in message.embeds:
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+
+        for field in embed.fields:
+            parts.append(field.name or "")
+            parts.append(field.value or "")
+
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+
+    return "\n".join(parts).casefold()
+
+
+def _score_reply_looks_failed(message: discord.Message) -> bool:
+    """Best-effort detection for a RikBot lookup that did not find the toon."""
+    text = _message_search_text(message)
+
+    failure_phrases = (
+        "not found",
+        "no result",
+        "no results",
+        "no player",
+        "no toon",
+        "no character",
+        "unknown player",
+        "unknown toon",
+        "unknown character",
+        "couldn't find",
+        "could not find",
+        "doesn't exist",
+        "does not exist",
+        "invalid toon",
+        "invalid player",
+    )
+
+    return any(phrase in text for phrase in failure_phrases)
+
+
+async def get_score_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """Resolve the channel used for %s EKP lookups."""
+    if SCORE_CHANNEL_ID:
+        channel = guild.get_channel(SCORE_CHANNEL_ID)
+
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+        try:
+            fetched = await bot.fetch_channel(SCORE_CHANNEL_ID)
+            if isinstance(fetched, discord.TextChannel):
+                return fetched
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    exact_names = {
+        "score",
+        "scores",
+        "ekp-score",
+        "ekp-scores",
+        "ekp_score",
+        "ekp_scores",
+        "score-check",
+        "score_check",
+    }
+
+    for channel in guild.text_channels:
+        if channel.name.casefold() in exact_names:
+            return channel
+
+    for channel in guild.text_channels:
+        name = channel.name.casefold()
+        if "score" in name and "ekp" in name:
+            return channel
+
+    return None
+
+
+async def run_score_lookup(
+    guild: discord.Guild,
+    toon: str,
+    bidder_id: int,
+) -> None:
+    """
+    Ask RikBot for the toon score, wait up to 3 seconds for another bot's reply,
+    then tag the Discord user who entered the bid. Lookups are serialized so
+    simultaneous bids cannot steal each other's RikBot responses.
+    """
+    toon = toon.strip()
+    if not toon:
+        return
+
+    score_channel = await get_score_channel(guild)
+    if score_channel is None:
+        print(
+            "[SCORE LOOKUP] No score channel found. "
+            "Set SCORE_CHANNEL_ID or use a recognizable score channel name."
+        )
+        return
+
+    async with score_lookup_lock:
+        started = asyncio.get_running_loop().time()
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.channel.id == score_channel.id
+                and message.author.bot
+                and bot.user is not None
+                and message.author.id != bot.user.id
+            )
+
+        try:
+            await score_channel.send(
+                f"%s {toon}",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[SCORE LOOKUP] Could not send score command: {exc}")
+            return
+
+        response = None
+        try:
+            response = await bot.wait_for(
+                "message",
+                timeout=SCORE_LOOKUP_DELAY_SECONDS,
+                check=check,
+            )
+        except asyncio.TimeoutError:
+            response = None
+
+        elapsed = asyncio.get_running_loop().time() - started
+        remaining = SCORE_LOOKUP_DELAY_SECONDS - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        if response is None or _score_reply_looks_failed(response):
+            tag_text = (
+                f"<@{bidder_id}> ⚠️ No score found for **"
+                f"{discord.utils.escape_markdown(toon)}**. Check the toon spelling."
+            )
+        else:
+            tag_text = f"<@{bidder_id}>"
+
+        try:
+            await score_channel.send(
+                tag_text,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[SCORE LOOKUP] Could not tag bidder: {exc}")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dhio fashion tracker
@@ -3565,57 +3729,6 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong")
 
 
-@bot.tree.command(
-    name="testscore",
-    description="Test whether the score bot responds to a command sent by this bot",
-)
-@app_commands.describe(
-    toon="Toon name to look up",
-    score_channel="Channel where the score command should be sent",
-)
-async def testscore(
-    interaction: discord.Interaction,
-    toon: str,
-    score_channel: discord.TextChannel,
-):
-    toon = toon.strip()
-    if not toon:
-        await interaction.response.send_message(
-            "Enter a toon name.", ephemeral=True
-        )
-        return
-
-    await interaction.response.send_message(
-        f"Sending `%s {toon}` in {score_channel.mention}, then tagging you in 10 seconds.",
-        ephemeral=True,
-    )
-
-    try:
-        await score_channel.send(
-            f"%s {toon}",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        await interaction.followup.send(
-            f"I couldn't send the score command in {score_channel.mention}: {exc}",
-            ephemeral=True,
-        )
-        return
-
-    await asyncio.sleep(10)
-
-    try:
-        await score_channel.send(
-            interaction.user.mention,
-            allowed_mentions=discord.AllowedMentions(users=True),
-        )
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        await interaction.followup.send(
-            f"The score command was sent, but I couldn't tag you afterward: {exc}",
-            ephemeral=True,
-        )
-
-
 @bot.tree.command(name="open", description="Open a new bid thread")
 @app_commands.describe(
     toon="The toon name for the opening bid",
@@ -3677,6 +3790,15 @@ async def open_bid(
         message_id=sent.id,
     )
     save_state()
+
+    if interaction.guild is not None:
+        asyncio.create_task(
+            run_score_lookup(
+                interaction.guild,
+                toon,
+                interaction.user.id,
+            )
+        )
 
 
 @bot.tree.command(name="bid", description="Place an outbid")
@@ -3741,6 +3863,10 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
             return
 
         user_bid_count = count_user_bids(state, interaction.user.id)
+        first_entry_in_thread = not any(
+            entry.get("bidder_id") == interaction.user.id
+            for entry in state.get("bid_log", [])
+        )
 
         if user_bid_count >= 7:
             await reply(
@@ -3836,6 +3962,15 @@ async def bid(interaction: discord.Interaction, toon: str, amount: int):
         state["bid_log"][-1]["message_id"] = sent.id
 
         save_state()
+
+        if first_entry_in_thread and interaction.guild is not None:
+            asyncio.create_task(
+                run_score_lookup(
+                    interaction.guild,
+                    toon,
+                    interaction.user.id,
+                )
+            )
 
 
 @bot.tree.command(name="history", description="Show bid history for this thread")
