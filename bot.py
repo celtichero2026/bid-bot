@@ -19,13 +19,19 @@ LEADER_ROLE_IDS = [
     1415053351116079219,  # main server
 ]
 
-ALLOWED_CHANNEL_IDS = [
+# Forum channels used for EKP bidding. New posts in these forums automatically
+# receive the minimum-bid chart button before anyone runs /open.
+BID_FORUM_CHANNEL_IDS = [
     1447764043090755646,  # Druid
     1447764333894434837,  # Mage
     1447764834132295782,  # Warrior
     1447765010800578782,  # Rogue
     1447765179172524184,  # Ranger
     1447765439366168687,  # No Class Required
+]
+
+ALLOWED_CHANNEL_IDS = [
+    *BID_FORUM_CHANNEL_IDS,
     1527381268264653001,  # Roll Channel
     1491844512828489918,  # TEST SERVER
 ]
@@ -3165,6 +3171,27 @@ async def on_ready():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# New bid forum thread setup
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    """Add the min-bid chart button to every new bid forum post."""
+    if thread.parent_id not in BID_FORUM_CHANNEL_IDS:
+        return
+
+    try:
+        await thread.send(
+            "🔎 Check the minimum bid before using `/open`.",
+            view=MinBidChartView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"[MIN BID CHART] Could not add chart button to thread {thread.id}: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Thread chat discouragement
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -4120,7 +4147,7 @@ async def set_min_bid_chart(
 
     preview = discord.Embed(
         title="✅ Minimum-bid chart saved",
-        description="New `/open` posts will include a **View Min Bid Chart** button.",
+        description="New bid forum threads will automatically receive a **View Min Bid Chart** button.",
     )
     preview.set_image(url=image_url)
     await interaction.followup.send(
@@ -4250,13 +4277,9 @@ async def open_bid(
         "✅ Bid opened",
         f"{toon} {amount:,} | Min bid: {min_bid:,} | Min outbid: {outbid_inc:,}",
     ]
-    chart_view = None
-    if min_bid_chart_url:
-        chart_view = MinBidChartView()
 
     await interaction.response.send_message(
         "\n".join(open_lines),
-        view=chart_view,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
