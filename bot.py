@@ -4252,7 +4252,6 @@ async def open_bid(
     ]
     chart_view = None
     if min_bid_chart_url:
-        open_lines.append("🔎 **Verify minimum bid:**")
         chart_view = MinBidChartView()
 
     await interaction.response.send_message(
